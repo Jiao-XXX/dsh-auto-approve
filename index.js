@@ -269,6 +269,9 @@ async function collectClassifierText(llm, options, signal) {
 
 async function classify(ctx, req, config, evidence, lifetimeSignal) {
   if (lifetimeSignal?.aborted) return { verdict: 'ask', detail: 'unloaded' }
+  if (req.signal !== undefined && !(req.signal instanceof AbortSignal)) {
+    return { verdict: 'ask', detail: 'invalid-signal' }
+  }
   if (req.signal?.aborted) return { verdict: 'ask', detail: 'aborted' }
 
   const selection = classifierModelSelection(ctx, config)

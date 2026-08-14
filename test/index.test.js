@@ -432,7 +432,7 @@ test('a malformed request signal delegates without creating a timeout resource',
     assert.deepEqual(await app.run(request), { result: MANUAL, nextCalls: 1 })
     assert.equal(timerCreations, 0)
     assert.equal(app.llmCalls, 0)
-    assert.match(app.logs[0], /decision=manual verdict=llm-error/)
+    assert.match(app.logs[0], /decision=manual verdict=invalid-signal/)
   } finally {
     globalThis.setTimeout = originalSetTimeout
     await app.dispose()
