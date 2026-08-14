@@ -1,109 +1,12 @@
 # dsh-auto-approve
 
-English | [中文](#中文)
-
-`dsh-auto-approve` adds an `Auto` permission preset to [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). In that preset, routine sandbox escalations may be approved once by a classifier model; deterministic danger matches, uncertain model decisions, timeouts, malformed responses, and internal failures continue to the normal human approval dialog.
-
-The bundle replaces the permission preset table with exactly three entries, in this order: `workspace-write`, `auto`, and `danger-full-access`. Outside the `auto` preset, the plugin delegates every approval request unchanged.
-
-## How it works
-
-For each `approval/request` in the `auto` preset, the plugin:
-
-1. Recovers the raw `tool/call` arguments from the in-memory session log.
-2. Checks the justification and tool arguments against a deterministic danger list.
-3. Sends the command, justification, target sandbox mode, and workspace path to the configured classifier model.
-4. Returns `allowed-once` only for the exact response `{"verdict":"approve"}`. Every other result delegates to the next responder, normally the Web UI.
-
-The built-in danger list covers destructive `rm -rf` targets, device writes and formatting, force-pushes, download-to-shell pipelines, destructive SQL, host shutdown, root-wide `chmod 777`, the shell fork bomb, and Terraform/Pulumi destruction. A model verdict can never override a danger-list match.
-
-## Install
-
-DeepSeek Harness must run on a supported Node.js version. This package is pure ESM JavaScript and has no build or `prepare` script, so installing it from Git does not require pnpm build authorization.
-
-From GitHub:
-
-```bash
-dsh plugin --profile web add github:Jiao-XXX/dsh-auto-approve
-```
-
-From a local checkout:
-
-```bash
-dsh plugin --profile web add ./dsh-auto-approve
-```
-
-Restart `dsh web`, open the Permissions selector, and choose `Auto`.
-
-To remove the bundle:
-
-```bash
-dsh plugin --profile web remove dsh-auto-approve
-```
-
-## Configuration
-
-| Field | Default | Meaning |
-| --- | --- | --- |
-| `presetName` | `auto` | Permission preset in which the responder is active. |
-| `provider` | `deepseek-official` | Registered `llm` provider route used for classification. |
-| `model` | `deepseek-chat` | Classifier model id passed to that provider. |
-| `timeoutMs` | `8000` | End-to-end classification deadline in milliseconds. |
-| `extraDangerPatterns` | `[]` | Case-insensitive regular expressions appended to the built-in list. |
-| `dangerPatterns` | `null` | `null` keeps the built-in list; an array replaces it completely. |
-
-To override the plugin row in a profile patch, restate every field because dsh patch `config` values are replaced rather than deep-merged:
-
-```yaml
-- id: auto-approve
-  config:
-    presetName: auto
-    provider: deepseek-official
-    model: deepseek-chat
-    timeoutMs: 8000
-    extraDangerPatterns:
-      - '\bkubectl\s+delete\b'
-    dangerPatterns: null
-```
-
-Invalid regular expressions fail immediately while the plugin loads.
-
-## Audit
-
-Every plugin decision writes one log line such as `decision=auto-approve verdict=approve` or `decision=manual pattern=...`. The authoritative audit ledger remains dsh's paired `approval/asked` and `approval/decided` session events.
-
-On the target Session page, click **Session log** or enter `/export`. Inspect the downloaded ZIP with:
-
-```bash
-unzip -p /path/to/dsh-session-*.zip session.jsonl |
-  jq -c 'select(.type == "approval/asked" or .type == "approval/decided")
-    | {type, seq, id: .data.id, toolName: .data.toolName,
-       reason: .data.reason, outcome: .data.outcome}'
-```
-
-The two events for one approval share `data.id`. An automatic grant records `outcome: "allowed-once"`.
-
-## Security considerations
-
-This plugin reduces approval prompts; it does not prove that a command is safe. Commands and justifications are untrusted model input. The classifier prompt tells the model to treat them only as data, and strict output parsing fails closed, but prompt injection and classifier mistakes remain possible. The deterministic list is intentionally evaluated first, yet no finite regular-expression list covers every destructive spelling or indirect effect.
-
-Use `workspace-write` when every escalation must receive human review. Add deployment-specific danger patterns for sensitive tools, and leave `dangerPatterns: null` unless you intend to replace the complete built-in protection. The classification request sends the command, justification, sandbox target, and workspace path to the configured LLM provider; account for that in your data-handling policy.
-
-## Development
-
-The test suite uses only Node's built-in test runner:
-
-```bash
-npm test
-```
-
-## 中文
+中文 | [English](#english)
 
 `dsh-auto-approve` 为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 增加 `Auto` 权限档。在该档位下，分类模型可以对例行的沙箱升级做一次性批准；命中确定性危险规则、模型拿不准、超时、响应格式错误或插件内部异常时，审批仍会交给正常的人工弹窗。
 
-该 bundle 会把权限预设表重述为且仅保留三个档位，顺序为 `workspace-write`、`auto`、`danger-full-access`。不在 `auto` 档时，插件会原样放行所有审批请求给后续应答者。
+该 bundle 会把权限预设表重述为四个档位，顺序为 `read-only`、`workspace-write`、`auto`、`danger-full-access`——即在 dsh 原生三档中间插入 `auto` 档，原有档位全部保留。不在 `auto` 档时，插件会原样放行所有审批请求给后续应答者。
 
-### 工作原理
+## 工作原理
 
 收到 `auto` 档的 `approval/request` 后，插件会：
 
@@ -114,7 +17,7 @@ npm test
 
 内置危险清单覆盖破坏性 `rm -rf` 目标、设备写入与格式化、强制推送、下载后直接送入 shell、破坏性 SQL、主机关机、对根路径递归 `chmod 777`、shell fork 炸弹，以及 Terraform/Pulumi 销毁。LLM 无法推翻已经命中的危险规则。
 
-### 安装
+## 安装
 
 DeepSeek Harness 需要运行在受支持的 Node.js 版本上。本包是纯 ESM JavaScript，没有构建或 `prepare` 脚本，因此从 Git 安装时不需要授权 pnpm 执行构建。
 
@@ -138,7 +41,7 @@ dsh plugin --profile web add ./dsh-auto-approve
 dsh plugin --profile web remove dsh-auto-approve
 ```
 
-### 配置
+## 配置
 
 | 字段 | 默认值 | 含义 |
 | --- | --- | --- |
@@ -165,7 +68,7 @@ dsh plugin --profile web remove dsh-auto-approve
 
 无效正则会在插件加载时立即报错，不会被静默忽略。
 
-### 审计
+## 审计
 
 插件的每次裁决都会输出一行日志，例如 `decision=auto-approve verdict=approve` 或 `decision=manual pattern=...`。权威审计台账仍由 dsh 内置、成对出现的 `approval/asked` 与 `approval/decided` 会话事件承担。
 
@@ -180,15 +83,120 @@ unzip -p /path/to/dsh-session-*.zip session.jsonl |
 
 同一次审批的两条事件具有相同的 `data.id`；自动批准对应 `outcome: "allowed-once"`。
 
-### 安全说明
+## 安全说明
 
 本插件减少的是审批弹窗，并不能证明一条命令绝对安全。命令和 justification 都是不可信的模型输入。分类提示会要求模型只把它们当作数据，严格输出解析也会安全回退，但提示注入与分类错误仍然存在。确定性清单始终优先执行，不过有限的正则无法覆盖所有破坏性写法和间接副作用。
 
 需要逐次人工确认时请使用 `workspace-write`。应为敏感工具追加部署专属危险规则；除非明确要替换整套内置保护，否则保持 `dangerPatterns: null`。分类请求会把命令、justification、目标沙箱模式和工作区路径发送给配置的 LLM provider，请将这一点纳入数据处理策略。
 
-### 开发
+## 已知限制
+
+Web UI 的 Permissions 选择器按预设机器名从一张内置图标表取图标，宿主配置的自定义档位（包括 `auto`）暂无图标可用——这需要上游 DeepSeek Harness 提供扩展点，插件侧无法干净地补上。
+
+## 开发
 
 测试只使用 Node 内置测试运行器：
+
+```bash
+npm test
+```
+
+## English
+
+`dsh-auto-approve` adds an `Auto` permission preset to [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). In that preset, routine sandbox escalations may be approved once by a classifier model; deterministic danger matches, uncertain model decisions, timeouts, malformed responses, and internal failures continue to the normal human approval dialog.
+
+The bundle restates the permission preset table as four entries, in this order: `read-only`, `workspace-write`, `auto`, and `danger-full-access` — the `auto` preset is inserted between the stock presets, all of which are preserved. Outside the `auto` preset, the plugin delegates every approval request unchanged.
+
+### How it works
+
+For each `approval/request` in the `auto` preset, the plugin:
+
+1. Recovers the raw `tool/call` arguments from the in-memory session log.
+2. Checks the justification and tool arguments against a deterministic danger list.
+3. Sends the command, justification, target sandbox mode, and workspace path to the configured classifier model.
+4. Returns `allowed-once` only for the exact response `{"verdict":"approve"}`. Every other result delegates to the next responder, normally the Web UI.
+
+The built-in danger list covers destructive `rm -rf` targets, device writes and formatting, force-pushes, download-to-shell pipelines, destructive SQL, host shutdown, root-wide `chmod 777`, the shell fork bomb, and Terraform/Pulumi destruction. A model verdict can never override a danger-list match.
+
+### Install
+
+DeepSeek Harness must run on a supported Node.js version. This package is pure ESM JavaScript and has no build or `prepare` script, so installing it from Git does not require pnpm build authorization.
+
+From GitHub:
+
+```bash
+dsh plugin --profile web add github:Jiao-XXX/dsh-auto-approve
+```
+
+From a local checkout:
+
+```bash
+dsh plugin --profile web add ./dsh-auto-approve
+```
+
+Restart `dsh web`, open the Permissions selector, and choose `Auto`.
+
+To remove the bundle:
+
+```bash
+dsh plugin --profile web remove dsh-auto-approve
+```
+
+### Configuration
+
+| Field | Default | Meaning |
+| --- | --- | --- |
+| `presetName` | `auto` | Permission preset in which the responder is active. |
+| `provider` | `deepseek-official` | Registered `llm` provider route used for classification. |
+| `model` | `deepseek-chat` | Classifier model id passed to that provider. |
+| `timeoutMs` | `8000` | End-to-end classification deadline in milliseconds. |
+| `extraDangerPatterns` | `[]` | Case-insensitive regular expressions appended to the built-in list. |
+| `dangerPatterns` | `null` | `null` keeps the built-in list; an array replaces it completely. |
+
+To override the plugin row in a profile patch, restate every field because dsh patch `config` values are replaced rather than deep-merged:
+
+```yaml
+- id: auto-approve
+  config:
+    presetName: auto
+    provider: deepseek-official
+    model: deepseek-chat
+    timeoutMs: 8000
+    extraDangerPatterns:
+      - '\bkubectl\s+delete\b'
+    dangerPatterns: null
+```
+
+Invalid regular expressions fail immediately while the plugin loads.
+
+### Audit
+
+Every plugin decision writes one log line such as `decision=auto-approve verdict=approve` or `decision=manual pattern=...`. The authoritative audit ledger remains dsh's paired `approval/asked` and `approval/decided` session events.
+
+On the target Session page, click **Session log** or enter `/export`. Inspect the downloaded ZIP with:
+
+```bash
+unzip -p /path/to/dsh-session-*.zip session.jsonl |
+  jq -c 'select(.type == "approval/asked" or .type == "approval/decided")
+    | {type, seq, id: .data.id, toolName: .data.toolName,
+       reason: .data.reason, outcome: .data.outcome}'
+```
+
+The two events for one approval share `data.id`. An automatic grant records `outcome: "allowed-once"`.
+
+### Security considerations
+
+This plugin reduces approval prompts; it does not prove that a command is safe. Commands and justifications are untrusted model input. The classifier prompt tells the model to treat them only as data, and strict output parsing fails closed, but prompt injection and classifier mistakes remain possible. The deterministic list is intentionally evaluated first, yet no finite regular-expression list covers every destructive spelling or indirect effect.
+
+Use `workspace-write` when every escalation must receive human review. Add deployment-specific danger patterns for sensitive tools, and leave `dangerPatterns: null` unless you intend to replace the complete built-in protection. The classification request sends the command, justification, sandbox target, and workspace path to the configured LLM provider; account for that in your data-handling policy.
+
+### Known limitations
+
+The Web UI Permissions selector resolves icons from a built-in glyph table keyed by preset machine name, so host-configured presets (including `auto`) render without an icon. Fixing this needs an upstream DeepSeek Harness extension point; the plugin cannot patch it cleanly.
+
+### Development
+
+The test suite uses only Node's built-in test runner:
 
 ```bash
 npm test
