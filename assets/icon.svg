@@ -1,25 +1,14 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16" fill="none" role="img" aria-labelledby="title desc">
   <title id="title">dsh-auto-approve</title>
-  <desc id="desc">A blue security shield with a yellow lightning bolt</desc>
+  <desc id="desc">A security shield with a lightning bolt</desc>
   <path
     d="M8.20554 0.899994L14.7901 3.36857V7.01026C14.7901 12 11.0466 14.2103 8.20554 15.3C5.36446 14.2103 1.62012 12 1.62012 7.01026V3.36857L8.20554 0.899994Z"
-    fill="#0969DA"
-    stroke="#F0F6FC"
-    stroke-width="1.5"
+    stroke="#737B86"
+    stroke-width="1.31831"
     stroke-linejoin="round"
   />
   <path
-    d="M8.20554 0.899994L14.7901 3.36857V7.01026C14.7901 12 11.0466 14.2103 8.20554 15.3C5.36446 14.2103 1.62012 12 1.62012 7.01026V3.36857L8.20554 0.899994Z"
-    fill="#0969DA"
-    stroke="#1F2328"
-    stroke-width="0.65"
-    stroke-linejoin="round"
-  />
-  <path
-    d="M9.35 3.15L5.25 8.35H7.45L6.65 12.8L11.3 7.1H8.85L9.35 3.15Z"
-    fill="#FFD33D"
-    stroke="#1F2328"
-    stroke-width="0.55"
-    stroke-linejoin="round"
+    d="M9.23047 3.44531L5.38281 8.52344H7.61719L6.86719 12.6953L11.0078 7.16406H8.71875L9.23047 3.44531Z"
+    fill="#737B86"
   />
 </svg>

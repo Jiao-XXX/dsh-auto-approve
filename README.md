@@ -45,7 +45,7 @@
 
 ## 安装
 
-DeepSeek Harness 需要运行在受支持的 Node.js 版本上。本包是纯 ESM JavaScript，没有构建或 `prepare` 脚本，因此从 Git 安装时不需要授权 pnpm 执行构建。
+DeepSeek Harness 需要运行在受支持的 Node.js 版本上。宿主侧插件为纯 ESM JavaScript，浏览器注册脚本也作为运行时文件随仓库直接提交。本包没有 `build`、`prepare` 或 `install` 脚本，因此从 Git 安装时不需要授权 pnpm 执行构建。
 
 从 GitHub 安装：
 
@@ -123,7 +123,7 @@ unzip -p /path/to/dsh-session-*.zip session.jsonl |
 
 ## 已知限制
 
-Web UI 的 Permissions 选择器按预设机器名从一张内置图标表取图标，宿主配置的自定义档位（包括 `auto`）暂无图标可用——这需要上游 DeepSeek Harness 提供扩展点，插件侧无法干净地补上。
+DeepSeek Harness rc.6 的 Permissions 选择器尚未提供自定义预设图标 API。本插件因此通过浏览器侧的 best-effort 兼容层识别默认 `Auto` 触发器和菜单项，再补上图标。该兼容层依赖 rc.6 的 DOM 结构和无障碍文案；dsh 升级或权限预设被重命名后，图标可能再次消失。这种失效只影响图标显示，不影响 `Auto` 审批、危险规则或人工兜底。
 
 ## FAQ
 
@@ -198,7 +198,7 @@ The built-in danger list covers destructive `rm -rf` targets, device writes and 
 
 ### Install
 
-DeepSeek Harness must run on a supported Node.js version. This package is pure ESM JavaScript and has no build or `prepare` script, so installing it from Git does not require pnpm build authorization.
+DeepSeek Harness must run on a supported Node.js version. The host-side plugin is pure ESM JavaScript, and the browser registration script is committed directly as a runtime file. The package has no `build`, `prepare`, or `install` script, so installing it from Git does not require pnpm build authorization.
 
 From GitHub:
 
@@ -276,7 +276,7 @@ Use `workspace-write` when every escalation must receive human review. Add deplo
 
 ### Known limitations
 
-The Web UI Permissions selector resolves icons from a built-in glyph table keyed by preset machine name, so host-configured presets (including `auto`) render without an icon. Fixing this needs an upstream DeepSeek Harness extension point; the plugin cannot patch it cleanly.
+The Permissions selector in DeepSeek Harness rc.6 does not expose an API for custom preset icons. The plugin therefore uses a best-effort browser compatibility layer to recognize the default `Auto` trigger and menu item and add the icon. This layer depends on rc.6's DOM structure and accessible copy, so a dsh upgrade or renamed permission presets may make the icon disappear again. Such a failure is cosmetic only: it does not affect `Auto` approvals, danger rules, or the human fallback.
 
 ### FAQ
 
