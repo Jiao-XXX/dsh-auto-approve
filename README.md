@@ -1,13 +1,36 @@
-# dsh-auto-approve
+<p align="center">
+  <img src="./assets/icon.svg" width="96" alt="dsh-auto-approve shield and lightning icon">
+</p>
 
-[![test](https://github.com/Jiao-XXX/dsh-auto-approve/actions/workflows/test.yml/badge.svg)](https://github.com/Jiao-XXX/dsh-auto-approve/actions/workflows/test.yml)
-[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+<h1 align="center">dsh-auto-approve</h1>
+
+<p align="center">
+  <strong>比 Workspace Write 更省心，比 Full access 更安全 / More convenient than Workspace Write, safer than Full access</strong>
+</p>
+
+<p align="center">
+  <a href="https://github.com/Jiao-XXX/dsh-auto-approve/actions/workflows/test.yml"><img src="https://github.com/Jiao-XXX/dsh-auto-approve/actions/workflows/test.yml/badge.svg" alt="test status"></a>
+  <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license: MIT"></a>
+</p>
 
 中文 | [English](#english)
 
 `dsh-auto-approve` 为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 增加 `Auto` 权限档。在该档位下，分类模型可以对例行的沙箱升级做一次性批准；命中确定性危险规则、模型拿不准、超时、响应格式错误或插件内部异常时，审批仍会交给正常的人工弹窗。
 
 该 bundle 会把权限预设表重述为四个档位，顺序为 `read-only`、`workspace-write`、`auto`、`danger-full-access`——即在 dsh 原生三档中间插入 `auto` 档，原有档位全部保留。不在 `auto` 档时，插件会原样放行所有审批请求给后续应答者。
+
+## 定位
+
+`auto` 是 `workspace-write` 之上的低打扰安全层：保留同一沙箱边界，把例行升级交给分类器；命中危险清单、分类器拿不准或分类失败时，才回到人工审批。
+
+直观地说，它类似 [Claude Code 的 **auto mode**](https://code.claude.com/docs/en/permission-modes) 与 [Codex 的 **Auto-review mode**](https://developers.openai.com/codex/agent-approvals-security)：把例行审批交给安全评审，危险或拿不准时再交还人工。
+
+| 权限档 | 沙箱范围 | 什么时候弹窗 | 适合场景 |
+| --- | --- | --- | --- |
+| `read-only` | 只读工作区，不能修改项目文件 | 需要写入、联网或执行其他越界操作时 | 代码审阅、探索和敏感仓库 |
+| `workspace-write` | 可读写工作区；工作区外和受限能力仍被隔离 | 需要联网、写工作区外或进行其他沙箱升级时 | 常规开发；每次升级都由人确认 |
+| **`auto`** | **与 `workspace-write` 相同** | **例行升级自动批；命中删库级危险清单、分类器拿不准或失败时才问人** | **长任务和依赖安装；减少打断且全程保留审计台账** |
+| `danger-full-access` | 不受工作区沙箱限制，按宿主权限运行 | 不弹窗（`approval: never`） | 仅限隔离、可丢弃且充分信任的环境 |
 
 ## 工作原理
 
@@ -109,6 +132,19 @@ npm test
 `dsh-auto-approve` adds an `Auto` permission preset to [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness). In that preset, routine sandbox escalations may be approved once by a classifier model; deterministic danger matches, uncertain model decisions, timeouts, malformed responses, and internal failures continue to the normal human approval dialog.
 
 The bundle restates the permission preset table as four entries, in this order: `read-only`, `workspace-write`, `auto`, and `danger-full-access` — the `auto` preset is inserted between the stock presets, all of which are preserved. Outside the `auto` preset, the plugin delegates every approval request unchanged.
+
+### Positioning
+
+`auto` is a lower-friction safety layer on top of `workspace-write`: it keeps the same sandbox boundary and sends routine escalations to the classifier, while danger-list matches, classifier uncertainty, and classification failures return to human approval.
+
+Think of it as DeepSeek Harness's counterpart to [Claude Code's **auto mode**](https://code.claude.com/docs/en/permission-modes) and [Codex's **Auto-review mode**](https://developers.openai.com/codex/agent-approvals-security): routine approvals are handled automatically, while dangerous or uncertain actions go back to a human.
+
+| Preset | Sandbox scope | When it prompts | Best for |
+| --- | --- | --- | --- |
+| `read-only` | Read-only workspace; project files cannot be changed | Writing, network access, or another out-of-bounds action needs escalation | Code review, exploration, and sensitive repositories |
+| `workspace-write` | Workspace reads and writes are allowed; outside paths and restricted capabilities remain isolated | Network access, writes outside the workspace, or another sandbox escalation | Everyday development where a human reviews every escalation |
+| **`auto`** | **Same as `workspace-write`** | **Routine escalations are auto-approved; destructive-list matches, classifier uncertainty, or failures go to a human** | **Long-running tasks and dependency installs; fewer interruptions with a complete audit trail** |
+| `danger-full-access` | No workspace sandbox boundary; commands run with host permissions | No prompt (`approval: never`) | Isolated, disposable, fully trusted environments only |
 
 ### How it works
 
