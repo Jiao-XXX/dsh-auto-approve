@@ -125,6 +125,39 @@ unzip -p /path/to/dsh-session-*.zip session.jsonl |
 
 Web UI 的 Permissions 选择器按预设机器名从一张内置图标表取图标，宿主配置的自定义档位（包括 `auto`）暂无图标可用——这需要上游 DeepSeek Harness 提供扩展点，插件侧无法干净地补上。
 
+## FAQ
+
+**为什么插件设置的"插件配置"页里没有本插件的卡片？**
+那个页面只显示 host 端 api-proxy 白名单里的官方命名空间（目前是 `bash`、`agent-loop`、`web-search-deepseek`）。上游文档明确说明：仓库外分发的第三方插件在不改动 host 代码的情况下无法在此页出现配置卡片。这是 DeepSeek Harness 当前版本对所有第三方插件的共同限制，不是本插件的缺陷。配置请用下文的 patch 方式。
+
+**"插件列表"页里怎么找到它？**
+列表页展示 Loader 树的全部插件行，搜 `dsh-auto-approve` 或条目 id `auto-approve` 即可。注意该页快照只在打开 Settings 时读取一次，装完插件后要关掉 Settings 重新打开；该页是官方设计的只读视图，没有启停按钮。
+
+**怎么临时关掉自动批准？**
+把会话权限档切回 `Workspace Write` 即可——插件对非 `auto` 档完全隐形，无需重启，这就是内置的开关。
+
+**怎么彻底停用？**
+在 profile 的用户层补丁 `$DSH_HOME/profiles/web/cordis.patch.yml`（默认 `~/.dsh/profiles/web/`）中追加以下内容并重启 `dsh web`；或直接 `dsh plugin --profile web remove dsh-auto-approve` 卸载：
+
+```yaml
+- id: auto-approve
+  disabled: true
+```
+
+**怎么修改分类模型等配置？**
+分类模型默认跟随 Settings → Models 里的默认模型，改默认模型即可（有 UI）。要单独指定分类模型或其他字段，在上述同一个 patch 文件里覆盖 config（必须重述全部字段），然后重启 `dsh web`：
+
+```yaml
+- id: auto-approve
+  config:
+    presetName: auto
+    provider: null
+    model: deepseek-chat   # 你 API 中的任意模型名；provider 为 null 时沿用默认模型的 provider
+    timeoutMs: 8000
+    extraDangerPatterns: []
+    dangerPatterns: null
+```
+
 ## 开发
 
 测试只使用 Node 内置测试运行器：
@@ -244,6 +277,39 @@ Use `workspace-write` when every escalation must receive human review. Add deplo
 ### Known limitations
 
 The Web UI Permissions selector resolves icons from a built-in glyph table keyed by preset machine name, so host-configured presets (including `auto`) render without an icon. Fixing this needs an upstream DeepSeek Harness extension point; the plugin cannot patch it cleanly.
+
+### FAQ
+
+**Why is there no card for this plugin on the plugin-settings "configuration" page?**
+That page only renders namespaces on the host api-proxy whitelist (currently `bash`, `agent-loop`, and `web-search-deepseek`). The upstream docs state that plugins distributed outside the DeepSeek Harness repository cannot surface configuration cards there without host changes. This limitation applies to every third-party plugin, not just this one. Configure the plugin through the patch mechanism below instead.
+
+**Where is it on the plugin inventory page?**
+The inventory tab lists every Loader-tree plugin row; search for `dsh-auto-approve` or the entry id `auto-approve`. The snapshot is read once when Settings opens, so reopen Settings after installing. The page is a deliberately read-only view with no enable/disable controls.
+
+**How do I pause auto-approval temporarily?**
+Switch the session's permission preset back to `Workspace Write`. The plugin is completely inert outside the `auto` preset — no restart needed; this is the built-in switch.
+
+**How do I disable it entirely?**
+Append the following to your profile's user patch layer at `$DSH_HOME/profiles/web/cordis.patch.yml` (default `~/.dsh/profiles/web/`) and restart `dsh web`, or uninstall with `dsh plugin --profile web remove dsh-auto-approve`:
+
+```yaml
+- id: auto-approve
+  disabled: true
+```
+
+**How do I change the classifier model or other settings?**
+The classifier follows the default model from Settings → Models, so changing that default (which has a UI) is usually enough. To pin a dedicated classifier model or change other fields, override the config in the same patch file (restate every field) and restart `dsh web`:
+
+```yaml
+- id: auto-approve
+  config:
+    presetName: auto
+    provider: null
+    model: deepseek-chat   # any model id from your API; provider null keeps the default model's provider
+    timeoutMs: 8000
+    extraDangerPatterns: []
+    dangerPatterns: null
+```
 
 ### Development
 
