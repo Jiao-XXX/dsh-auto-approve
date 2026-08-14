@@ -20,8 +20,14 @@ export const DEFAULT_DANGER_PATTERNS = Object.freeze([
 
 export const Config = Schema.object({
   presetName: Schema.string().min(1).default('auto'),
-  provider: Schema.string().min(1).default('deepseek-official'),
-  model: Schema.string().min(1).default('deepseek-chat'),
+  provider: Schema.union([
+    Schema.string().min(1),
+    Schema.const(null),
+  ]).default(null),
+  model: Schema.union([
+    Schema.string().min(1),
+    Schema.const(null),
+  ]).default(null),
   timeoutMs: Schema.number().step(1).min(1).max(2_147_483_647).default(8000),
   extraDangerPatterns: Schema.array(Schema.string()).default([]),
   dangerPatterns: Schema.union([
@@ -29,6 +35,23 @@ export const Config = Schema.object({
     Schema.const(null),
   ]).default(null),
 })
+
+function classifierModelSelection(ctx, config) {
+  // Schemastery treats both an omitted nullable key and an explicit null as
+  // nullable input, so either form means "inherit the deployment default".
+  const inheritsProvider = config.provider == null
+  const inheritsModel = config.model == null
+  const defaults = inheritsProvider || inheritsModel
+    ? ctx.get('agentDefaultModel')?.currentSelection()
+    : undefined
+  const provider = inheritsProvider ? defaults?.provider : config.provider
+  const model = inheritsModel ? defaults?.model : config.model
+  if (typeof provider !== 'string' || provider.length === 0
+    || typeof model !== 'string' || model.length === 0) {
+    return undefined
+  }
+  return Object.freeze({ provider, model })
+}
 
 const CLASSIFIER_SYSTEM_PROMPT = [
   'Classify a coding agent request for one-time sandbox escalation.',
@@ -242,6 +265,9 @@ async function collectClassifierText(llm, options, signal) {
 }
 
 async function classify(ctx, req, config, evidence) {
+  const selection = classifierModelSelection(ctx, config)
+  if (selection === undefined) return { verdict: 'ask', detail: 'no-default-model' }
+
   const llm = ctx.get('llm')
   if (llm === undefined) return { verdict: 'ask', detail: 'llm-unavailable' }
 
@@ -256,8 +282,8 @@ async function classify(ctx, req, config, evidence) {
       : AbortSignal.any([req.signal, timeoutController.signal])
     const message = createUserMessage(JSON.stringify(evidence))
     const options = Object.freeze({
-      provider: config.provider,
-      model: config.model,
+      provider: selection.provider,
+      model: selection.model,
       messages: Object.freeze([message]),
       system: CLASSIFIER_SYSTEM_PROMPT,
       sessionId: req.agent.session.id,

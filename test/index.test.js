@@ -60,11 +60,17 @@ function harness({
   current = () => preset,
   loggerInfo,
   llmAvailable = true,
+  defaultModelAvailable = true,
+  defaultModelSelection = () => ({
+    provider: 'deepseek-official',
+    model: 'deepseek-chat',
+  }),
 } = {}) {
   let handler
   let listenerOptions
   let llmCalls = 0
   let lastLlmOptions
+  let defaultModelReads = 0
   const logs = []
   const llm = {
     stream(options) {
@@ -77,6 +83,15 @@ function harness({
     get(service) {
       if (service === 'permissionPresets') return { current }
       if (service === 'llm') return llmAvailable ? llm : undefined
+      if (service === 'agentDefaultModel') {
+        if (!defaultModelAvailable) return undefined
+        return {
+          currentSelection() {
+            defaultModelReads += 1
+            return defaultModelSelection()
+          },
+        }
+      }
       return undefined
     },
     on(event, listener, options) {
@@ -96,6 +111,7 @@ function harness({
     get listenerOptions() { return listenerOptions },
     get llmCalls() { return llmCalls },
     get lastLlmOptions() { return lastLlmOptions },
+    get defaultModelReads() { return defaultModelReads },
     logs,
     async run(request = requestOf()) {
       let nextCalls = 0
@@ -219,6 +235,86 @@ test('approve is the only automatic approval exit', async () => {
     workspacePath: '/workspace/project',
   })
   assert.match(app.logs[0], /decision=auto-approve verdict=approve/)
+})
+
+test('null provider and model follow the current default model on every classification', async () => {
+  let selection = { provider: 'openai-compatible', model: 'general-model' }
+  const app = harness({
+    config: { provider: null, model: null },
+    defaultModelSelection: () => selection,
+  })
+
+  assert.deepEqual(await app.run(), { result: 'allowed-once', nextCalls: 0 })
+  assert.deepEqual(
+    { provider: app.lastLlmOptions.provider, model: app.lastLlmOptions.model },
+    selection,
+  )
+
+  selection = { provider: 'custom-provider', model: 'updated-model' }
+  assert.deepEqual(await app.run(), { result: 'allowed-once', nextCalls: 0 })
+  assert.deepEqual(
+    { provider: app.lastLlmOptions.provider, model: app.lastLlmOptions.model },
+    selection,
+  )
+  assert.equal(app.defaultModelReads, 2)
+})
+
+test('missing default model delegates with a distinct detail', async () => {
+  const app = harness({
+    config: { provider: null, model: null },
+    defaultModelAvailable: false,
+  })
+  assert.deepEqual(await app.run(), { result: MANUAL, nextCalls: 1 })
+  assert.equal(app.llmCalls, 0)
+  assert.match(app.logs[0], /decision=manual verdict=no-default-model/)
+})
+
+test('a default-model lookup exception still delegates instead of escaping', async () => {
+  const app = harness({
+    defaultModelSelection: () => { throw new Error('settings lookup failed') },
+  })
+  assert.deepEqual(await app.run(), { result: MANUAL, nextCalls: 1 })
+  assert.equal(app.llmCalls, 0)
+  assert.match(app.logs[0], /decision=manual verdict=internal-error/)
+})
+
+test('an explicit model inherits only the provider from the current default', async () => {
+  const app = harness({
+    config: { provider: null, model: 'cheap-classifier' },
+    defaultModelSelection: () => ({ provider: 'openai-compatible', model: 'general-model' }),
+  })
+  assert.deepEqual(await app.run(), { result: 'allowed-once', nextCalls: 0 })
+  assert.deepEqual(
+    { provider: app.lastLlmOptions.provider, model: app.lastLlmOptions.model },
+    { provider: 'openai-compatible', model: 'cheap-classifier' },
+  )
+  assert.equal(app.defaultModelReads, 1)
+})
+
+test('an explicit provider inherits only the model from the current default', async () => {
+  const app = harness({
+    config: { provider: 'dedicated-provider', model: null },
+    defaultModelSelection: () => ({ provider: 'openai-compatible', model: 'general-model' }),
+  })
+  assert.deepEqual(await app.run(), { result: 'allowed-once', nextCalls: 0 })
+  assert.deepEqual(
+    { provider: app.lastLlmOptions.provider, model: app.lastLlmOptions.model },
+    { provider: 'dedicated-provider', model: 'general-model' },
+  )
+  assert.equal(app.defaultModelReads, 1)
+})
+
+test('explicit provider and model preserve the 0.1.0 route without reading defaults', async () => {
+  const app = harness({
+    config: { provider: 'deepseek-official', model: 'deepseek-chat' },
+    defaultModelSelection: () => { throw new Error('defaults must not be read') },
+  })
+  assert.deepEqual(await app.run(), { result: 'allowed-once', nextCalls: 0 })
+  assert.deepEqual(
+    { provider: app.lastLlmOptions.provider, model: app.lastLlmOptions.model },
+    { provider: 'deepseek-official', model: 'deepseek-chat' },
+  )
+  assert.equal(app.defaultModelReads, 0)
 })
 
 test('ask delegates to the human responder', async () => {

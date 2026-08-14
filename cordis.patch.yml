@@ -3,8 +3,8 @@
       name: dsh-auto-approve
       config:
         presetName: auto
-        provider: deepseek-official
-        model: deepseek-chat
+        provider: null
+        model: null
         timeoutMs: 8000
         extraDangerPatterns: []
         dangerPatterns: null

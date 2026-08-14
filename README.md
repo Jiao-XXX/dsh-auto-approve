@@ -72,11 +72,17 @@ dsh plugin --profile web remove dsh-auto-approve
 | 字段 | 默认值 | 含义 |
 | --- | --- | --- |
 | `presetName` | `auto` | 插件应答者生效的权限档名。 |
-| `provider` | `deepseek-official` | 分类使用的已注册 `llm` provider 路由。 |
-| `model` | `deepseek-chat` | 传给该 provider 的分类模型 id。 |
+| `provider` | `null` | `null` = 使用 **Settings → Models** 中配置的默认模型 provider，任何 API 均适用。 |
+| `model` | `null` | `null` = 使用 **Settings → Models** 中配置的默认模型 id，任何 API 均适用。 |
 | `timeoutMs` | `8000` | 分类调用的端到端超时，单位毫秒。 |
 | `extraDangerPatterns` | `[]` | 追加到内置清单的大小写不敏感正则。 |
 | `dangerPatterns` | `null` | `null` 保留内置清单；数组会整体替换内置清单。 |
+
+`provider` 与 `model` 会在每次分类时独立解析，因此有三种常见用法：
+
+1. **默认零配置**：两者保持 `null`，自动跟随你的默认模型；无论接入 DeepSeek、自定义 OpenAI 兼容端点还是其他 API，都可以直接使用 Auto 档。
+2. **同一 API 下换用更便宜的分类模型**：只把 `model` 设为你自己 API 中的模型名，`provider` 保持 `null`。
+3. **指定完全不同的 provider**：同时显式配置 `provider` 与 `model`。
 
 若要在 profile patch 中覆盖插件配置，因为 dsh 会整体替换 `config` 而不是深度合并，必须重述全部字段：
 
@@ -84,8 +90,8 @@ dsh plugin --profile web remove dsh-auto-approve
 - id: auto-approve
   config:
     presetName: auto
-    provider: deepseek-official
-    model: deepseek-chat
+    provider: null
+    model: null
     timeoutMs: 8000
     extraDangerPatterns:
       - '\bkubectl\s+delete\b'
@@ -113,7 +119,7 @@ unzip -p /path/to/dsh-session-*.zip session.jsonl |
 
 本插件减少的是审批弹窗，并不能证明一条命令绝对安全。命令和 justification 都是不可信的模型输入。分类提示会要求模型只把它们当作数据，严格输出解析也会安全回退，但提示注入与分类错误仍然存在。确定性清单始终优先执行，不过有限的正则无法覆盖所有破坏性写法和间接副作用。
 
-需要逐次人工确认时请使用 `workspace-write`。应为敏感工具追加部署专属危险规则；除非明确要替换整套内置保护，否则保持 `dangerPatterns: null`。分类请求会把命令、justification、目标沙箱模式和工作区路径发送给配置的 LLM provider，请将这一点纳入数据处理策略。
+需要逐次人工确认时请使用 `workspace-write`。应为敏感工具追加部署专属危险规则；除非明确要替换整套内置保护，否则保持 `dangerPatterns: null`。分类请求会把命令、justification、目标沙箱模式和工作区路径发送给最终解析出的 LLM provider，请将这一点纳入数据处理策略。
 
 ## 已知限制
 
@@ -186,11 +192,17 @@ dsh plugin --profile web remove dsh-auto-approve
 | Field | Default | Meaning |
 | --- | --- | --- |
 | `presetName` | `auto` | Permission preset in which the responder is active. |
-| `provider` | `deepseek-official` | Registered `llm` provider route used for classification. |
-| `model` | `deepseek-chat` | Classifier model id passed to that provider. |
+| `provider` | `null` | `null` = use the default model provider configured under **Settings → Models**; any API is supported. |
+| `model` | `null` | `null` = use the default model id configured under **Settings → Models**; any API is supported. |
 | `timeoutMs` | `8000` | End-to-end classification deadline in milliseconds. |
 | `extraDangerPatterns` | `[]` | Case-insensitive regular expressions appended to the built-in list. |
 | `dangerPatterns` | `null` | `null` keeps the built-in list; an array replaces it completely. |
+
+`provider` and `model` are resolved independently for every classification, which supports three common setups:
+
+1. **Zero-config default**: leave both as `null` to follow your default model. Auto works directly whether you use DeepSeek, a custom OpenAI-compatible endpoint, or any other API.
+2. **A cheaper classifier on the same API**: set only `model` to a model id offered by your API and leave `provider` as `null`.
+3. **A completely different provider**: set both `provider` and `model` explicitly.
 
 To override the plugin row in a profile patch, restate every field because dsh patch `config` values are replaced rather than deep-merged:
 
@@ -198,8 +210,8 @@ To override the plugin row in a profile patch, restate every field because dsh p
 - id: auto-approve
   config:
     presetName: auto
-    provider: deepseek-official
-    model: deepseek-chat
+    provider: null
+    model: null
     timeoutMs: 8000
     extraDangerPatterns:
       - '\bkubectl\s+delete\b'
@@ -227,7 +239,7 @@ The two events for one approval share `data.id`. An automatic grant records `out
 
 This plugin reduces approval prompts; it does not prove that a command is safe. Commands and justifications are untrusted model input. The classifier prompt tells the model to treat them only as data, and strict output parsing fails closed, but prompt injection and classifier mistakes remain possible. The deterministic list is intentionally evaluated first, yet no finite regular-expression list covers every destructive spelling or indirect effect.
 
-Use `workspace-write` when every escalation must receive human review. Add deployment-specific danger patterns for sensitive tools, and leave `dangerPatterns: null` unless you intend to replace the complete built-in protection. The classification request sends the command, justification, sandbox target, and workspace path to the configured LLM provider; account for that in your data-handling policy.
+Use `workspace-write` when every escalation must receive human review. Add deployment-specific danger patterns for sensitive tools, and leave `dangerPatterns: null` unless you intend to replace the complete built-in protection. The classification request sends the command, justification, sandbox target, and workspace path to the resolved LLM provider; account for that in your data-handling policy.
 
 ### Known limitations
 
