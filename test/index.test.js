@@ -65,13 +65,17 @@ function harness({
     provider: 'deepseek-official',
     model: 'deepseek-chat',
   }),
+  listenerDisposeError,
 } = {}) {
   let handler
   let listenerOptions
+  let listenerActive = false
+  let listenerDisposeCalls = 0
   let llmCalls = 0
   let lastLlmOptions
   let defaultModelReads = 0
   const logs = []
+  const effects = []
   const llm = {
     stream(options) {
       llmCalls += 1
@@ -98,6 +102,31 @@ function harness({
       assert.equal(event, 'approval/request')
       handler = listener
       listenerOptions = options
+      listenerActive = true
+      let live = true
+      return () => {
+        if (!live) return false
+        live = false
+        listenerActive = false
+        listenerDisposeCalls += 1
+        if (listenerDisposeError !== undefined) throw listenerDisposeError
+        return true
+      }
+    },
+    effect(setup, label) {
+      const teardown = setup()
+      let live = true
+      let disposal
+      const dispose = () => {
+        if (!live) return disposal
+        live = false
+        disposal = Promise.resolve().then(async () => {
+          if (typeof teardown === 'function') await teardown()
+        })
+        return disposal
+      }
+      effects.push({ label, dispose })
+      return dispose
     },
     logger: {
       info(message) {
@@ -107,8 +136,12 @@ function harness({
     },
   }
   apply(ctx, config)
+  let disposal
   return {
     get listenerOptions() { return listenerOptions },
+    get listenerActive() { return listenerActive },
+    get listenerDisposeCalls() { return listenerDisposeCalls },
+    get effectLabels() { return effects.map(effect => effect.label) },
     get llmCalls() { return llmCalls },
     get lastLlmOptions() { return lastLlmOptions },
     get defaultModelReads() { return defaultModelReads },
@@ -121,12 +154,19 @@ function harness({
       })
       return { result, nextCalls }
     },
+    dispose() {
+      disposal ??= (async () => {
+        for (const effect of effects.splice(0).reverse()) await effect.dispose()
+      })()
+      return disposal
+    },
   }
 }
 
 test('registers ahead of the Web responder', () => {
   const app = harness()
   assert.deepEqual(app.listenerOptions, { prepend: true })
+  assert.deepEqual(app.effectLabels, ['dsh-auto-approve: abort and drain active classifications'])
 })
 
 test('non-auto presets delegate without touching the LLM', async () => {
@@ -223,6 +263,7 @@ test('approve is the only automatic approval exit', async () => {
   )
   assert.equal(app.lastLlmOptions.sessionId, 'session-1')
   assert.ok(app.lastLlmOptions.signal instanceof AbortSignal)
+  assert.match(app.lastLlmOptions.system, /Return exactly one JSON object and nothing else/)
   assert.ok(Object.isFrozen(app.lastLlmOptions.messages))
   assert.ok(Object.isFrozen(app.lastLlmOptions.messages[0]))
   const evidence = JSON.parse(app.lastLlmOptions.messages[0].content[0].text)
@@ -235,6 +276,17 @@ test('approve is the only automatic approval exit', async () => {
     workspacePath: '/workspace/project',
   })
   assert.match(app.logs[0], /decision=auto-approve verdict=approve/)
+})
+
+test('classifierPrompt replaces the default system prompt', async () => {
+  const classifierPrompt = 'Classify conservatively and return only the required verdict JSON.'
+  const app = harness({ config: { classifierPrompt } })
+  assert.deepEqual(await app.run(), { result: 'allowed-once', nextCalls: 0 })
+  assert.equal(app.lastLlmOptions.system, classifierPrompt)
+})
+
+test('classifierPrompt rejects an empty string at plugin load', () => {
+  assert.throws(() => harness({ config: { classifierPrompt: '' } }))
 })
 
 test('null provider and model follow the current default model on every classification', async () => {
@@ -366,6 +418,27 @@ test('timeout delegates even when the LLM iterator ignores its signal', async ()
   assert.match(app.logs[0], /decision=manual verdict=timeout/)
 })
 
+test('a malformed request signal delegates without creating a timeout resource', async () => {
+  const app = harness()
+  const originalSetTimeout = globalThis.setTimeout
+  let timerCreations = 0
+  globalThis.setTimeout = () => {
+    timerCreations += 1
+    return { kind: 'unexpected-test-timer' }
+  }
+  try {
+    const request = requestOf()
+    request.signal = { aborted: false }
+    assert.deepEqual(await app.run(request), { result: MANUAL, nextCalls: 1 })
+    assert.equal(timerCreations, 0)
+    assert.equal(app.llmCalls, 0)
+    assert.match(app.logs[0], /decision=manual verdict=llm-error/)
+  } finally {
+    globalThis.setTimeout = originalSetTimeout
+    await app.dispose()
+  }
+})
+
 test('missing LLM service delegates to the human responder', async () => {
   const app = harness({ llmAvailable: false })
   assert.deepEqual(await app.run(), { result: MANUAL, nextCalls: 1 })
@@ -388,9 +461,12 @@ test('request cancellation delegates whether already or newly aborted', async (t
   await t.test('aborted while streaming', async () => {
     const controller = new AbortController()
     let returnCalls = 0
+    let announceStream
+    const streamStarted = new Promise(resolve => { announceStream = resolve })
     const app = harness({
       stream: () => ({
         [Symbol.asyncIterator]() {
+          announceStream()
           return {
             next: () => new Promise(() => {}),
             return() {
@@ -402,11 +478,121 @@ test('request cancellation delegates whether already or newly aborted', async (t
       }),
     })
     const pending = app.run(requestOf({ signal: controller.signal }))
+    await streamStarted
     controller.abort(new Error('cancelled during classification'))
     assert.deepEqual(await pending, { result: MANUAL, nextCalls: 1 })
     assert.equal(returnCalls, 1)
     assert.match(app.logs[0], /decision=manual verdict=aborted/)
   })
+})
+
+test('unload removes the listener, aborts classification, and awaits iterator cleanup', async () => {
+  let announceStream
+  const streamStarted = new Promise(resolve => { announceStream = resolve })
+  let announceReturn
+  const returnStarted = new Promise(resolve => { announceReturn = resolve })
+  let releaseReturn
+  const returnGate = new Promise(resolve => { releaseReturn = resolve })
+  let returnCalls = 0
+  let listenerActiveAtAbort
+  let app
+  app = harness({
+    listenerDisposeError: new Error('simulated listener teardown failure'),
+    stream(options) {
+      options.signal.addEventListener('abort', () => {
+        listenerActiveAtAbort = app.listenerActive
+      }, { once: true })
+      announceStream(options.signal)
+      return {
+        [Symbol.asyncIterator]() {
+          return {
+            next: () => new Promise(() => {}),
+            return() {
+              returnCalls += 1
+              announceReturn()
+              return returnGate
+            },
+          }
+        },
+      }
+    },
+  })
+
+  const pending = app.run()
+  const classificationSignal = await streamStarted
+  let disposeSettled = false
+  const disposing = app.dispose().then(() => { disposeSettled = true })
+  await returnStarted
+
+  assert.equal(classificationSignal.aborted, true)
+  assert.equal(listenerActiveAtAbort, false)
+  assert.equal(app.listenerDisposeCalls, 1)
+  assert.equal(returnCalls, 1)
+  await Promise.resolve()
+  assert.equal(disposeSettled, false)
+
+  releaseReturn({ done: true })
+  assert.deepEqual(await pending, { result: MANUAL, nextCalls: 1 })
+  await disposing
+  assert.equal(disposeSettled, true)
+  assert.match(app.logs.at(-1), /decision=manual verdict=unloaded/)
+})
+
+test('the first request cancellation remains the audit detail when unload follows', async () => {
+  const requestController = new AbortController()
+  let announceStream
+  const streamStarted = new Promise(resolve => { announceStream = resolve })
+  let announceReturn
+  const returnStarted = new Promise(resolve => { announceReturn = resolve })
+  let releaseReturn
+  const returnGate = new Promise(resolve => { releaseReturn = resolve })
+  const app = harness({
+    stream(options) {
+      announceStream(options.signal)
+      return {
+        [Symbol.asyncIterator]() {
+          return {
+            next: () => new Promise(() => {}),
+            return() {
+              announceReturn()
+              return returnGate
+            },
+          }
+        },
+      }
+    },
+  })
+
+  const pending = app.run(requestOf({ signal: requestController.signal }))
+  const classificationSignal = await streamStarted
+  const requestReason = new Error('request cancelled first')
+  requestController.abort(requestReason)
+  await returnStarted
+  assert.equal(classificationSignal.reason, requestReason)
+
+  const disposing = app.dispose()
+  releaseReturn({ done: true })
+  assert.deepEqual(await pending, { result: MANUAL, nextCalls: 1 })
+  await disposing
+  assert.match(app.logs.at(-1), /decision=manual verdict=aborted/)
+})
+
+test('a stale waterfall callback captured before unload only delegates', async () => {
+  const app = harness({
+    stream: () => { throw new Error('stale callback must not reach the LLM') },
+    defaultModelSelection: () => { throw new Error('stale callback must not read model settings') },
+  })
+
+  await app.dispose()
+  assert.equal(app.listenerActive, false)
+  assert.equal(app.listenerDisposeCalls, 1)
+  assert.deepEqual(await app.run(), { result: MANUAL, nextCalls: 1 })
+  assert.equal(app.llmCalls, 0)
+  assert.equal(app.defaultModelReads, 0)
+  assert.match(app.logs[0], /decision=manual verdict=unloaded/)
+
+  await app.dispose()
+  assert.equal(app.listenerDisposeCalls, 1)
 })
 
 test('LLM throws and terminal failures delegate', async (t) => {

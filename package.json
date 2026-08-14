@@ -1,6 +1,6 @@
 {
   "name": "dsh-auto-approve",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "A conservative automatic approval preset for DeepSeek Harness sandbox escalations",
   "type": "module",
   "main": "index.js",
@@ -13,6 +13,7 @@
     "index.js",
     "client.js",
     "assets",
+    "docs",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
