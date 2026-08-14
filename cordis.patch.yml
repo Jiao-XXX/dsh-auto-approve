@@ -1,0 +1,25 @@
+- insert:
+    - id: auto-approve
+      name: dsh-auto-approve
+      config:
+        presetName: auto
+        provider: deepseek-official
+        model: deepseek-chat
+        timeoutMs: 8000
+        extraDangerPatterns: []
+        dangerPatterns: null
+
+- id: permission
+  config:
+    presets:
+      workspace-write:
+        sandbox: workspace-write
+        approval: ask
+      auto:
+        sandbox: workspace-write
+        approval: ask
+        name: Auto
+        description: 自动批准例行操作，仅危险动作询问
+      danger-full-access:
+        sandbox: danger-full-access
+        approval: never
