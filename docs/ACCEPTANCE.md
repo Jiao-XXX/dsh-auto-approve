@@ -128,101 +128,226 @@ console.log('dump-config: four presets and auto-approve config are exact')
 NODE
 ```
 
-## 3. Auto：例行联网升级自动批准并留下成对审计事件
+## 3. Auto：例行联网与工作区外精确写入自动批准
 
-1. 打开 `http://127.0.0.1:3080/`，新建一个独立 session。
-2. 在 Permissions 选择器选择 **Auto**；也可以先向会话发送 `/permission auto`。
-3. 用下面的命令把验收任务复制到剪贴板，粘贴到会话并发送：
+先生成一个位于 `$HOME/.cache`、明确不在 session 工作区和系统临时目录内的高熵目标。该文件不存在；验收命令同时需要联网和写入这个精确路径，因此必然经过一次沙箱升级审批。`~/.cache` 是本清单在 rc.6 真机验证过的例行缓存场景：
 
 ```bash
-printf '%s' '只执行一次 curl -sS --max-time 10 https://example.com，不要使用管道、不要写文件；返回 HTML title 后停止。' | pbcopy
+export DSH_ACCEPT_AUTO_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+test "${#DSH_ACCEPT_AUTO_ID}" -eq 36
+case "$DSH_ACCEPT_AUTO_ID" in
+  *[!0-9a-f-]*|'') printf 'invalid auto id: %s\n' "$DSH_ACCEPT_AUTO_ID" >&2; exit 1 ;;
+esac
+test -d "$HOME/.cache"
+export DSH_ACCEPT_AUTO_TARGET="$HOME/.cache/dsh-auto-approve-acceptance-auto-$DSH_ACCEPT_AUTO_ID.html"
+case "$DSH_ACCEPT_AUTO_TARGET" in
+  "$HOME"/.cache/dsh-auto-approve-acceptance-auto-*.html) ;;
+  *) printf 'unexpected auto target: %s\n' "$DSH_ACCEPT_AUTO_TARGET" >&2; exit 1 ;;
+esac
+case "$DSH_ACCEPT_AUTO_TARGET" in
+  "$DSH_ACCEPT_REPO"|"$DSH_ACCEPT_REPO"/*)
+    printf 'auto target is inside the session workspace: %s\n' "$DSH_ACCEPT_AUTO_TARGET" >&2
+    exit 1
+    ;;
+esac
+test ! -e "$DSH_ACCEPT_AUTO_TARGET"
+printf '%s' "$DSH_ACCEPT_REPO" | pbcopy
 ```
 
-通过条件：任务执行期间不出现人工审批弹窗，最终返回 `Example Domain`。从地址栏复制 session UUID 并赋值：
+1. 打开 `http://127.0.0.1:3080/`，新建一个独立 session；把刚复制的路径设为该 session 的工作区，并在界面确认工作区精确为 `/Users/ricksanchez/SmallProject/dsh-plugins/dsh-auto-approve`。
+2. 在 Permissions 选择器选择 **Auto**；等选择器恢复可点击并仍显示 **Auto** 后再继续，不能在切换仍处于禁用/加载状态时发送任务。
+3. 执行下面的命令，把**唯一允许执行的完整命令**复制到剪贴板；粘贴到会话并发送：
 
 ```bash
-export DSH_ACCEPT_AUTO_SESSION_ID='把地址栏中的 session UUID 粘贴到这里'
-test "$(printf '%s' "$DSH_ACCEPT_AUTO_SESSION_ID" | wc -c | tr -d ' ')" -eq 36
-curl --noproxy '*' -fsS \
-  "http://$DSH_ACCEPT_HOST:$DSH_ACCEPT_PORT/api/session.export?sessionId=$DSH_ACCEPT_AUTO_SESSION_ID&includeDescendants=false" \
-  -o "$DSH_ACCEPT_TMP/auto.zip"
-unzip -p "$DSH_ACCEPT_TMP/auto.zip" session.jsonl |
+printf '%s' "只执行下面这一条命令一次，不要改写命令，也不要运行任何其他命令：curl -fsS --location --max-time 20 https://example.com -o '$DSH_ACCEPT_AUTO_TARGET'。命令结束后只报告退出码。" | pbcopy
+```
+
+通过条件：任务确实执行，但全程不出现人工审批弹窗。回到终端，先确认精确目标已写入且内容正确。然后点击该会话 Header 的 **Session log** 下载 ZIP，把下载文件的绝对路径填入下面变量；rc.6 是根路径 SPA，不能从地址栏取得 session ID：
+
+```bash
+test -f "$DSH_ACCEPT_AUTO_TARGET"
+test "$(stat -f '%z' "$DSH_ACCEPT_AUTO_TARGET")" -gt 0
+rg -q '<title>Example Domain</title>' "$DSH_ACCEPT_AUTO_TARGET"
+export DSH_ACCEPT_AUTO_ZIP='/Users/ricksanchez/Downloads/dsh-session-把实际文件名补完整.zip'
+test -f "$DSH_ACCEPT_AUTO_ZIP"
+unzip -tq "$DSH_ACCEPT_AUTO_ZIP" session.jsonl
+unzip -p "$DSH_ACCEPT_AUTO_ZIP" session.jsonl |
   jq -c 'select(.type == "approval/asked" or .type == "approval/decided") | {type, id: .data.id, outcome: .data.outcome, reason: .data.reason}'
-unzip -p "$DSH_ACCEPT_TMP/auto.zip" session.jsonl |
+unzip -p "$DSH_ACCEPT_AUTO_ZIP" session.jsonl |
   jq -s -e '
-    [.[] | select(.type == "approval/asked" or .type == "approval/decided")] as $a
-    | ($a | length) == 2
-      and $a[-2].type == "approval/asked"
-      and $a[-1].type == "approval/decided"
-      and $a[-2].data.id == $a[-1].data.id
-      and $a[-1].data.outcome == "allowed-once"
+    [.[] | select(.type == "permission/preset" and .data.preset == "auto")] as $presets
+    | [.[] | select(.type == "approval/asked" or .type == "approval/decided")] as $events
+    | ($events | group_by(.data.id)) as $groups
+    | ($groups[0] // []) as $group
+    | ([$group[] | select(.type == "approval/asked")]) as $asked
+    | ([$group[] | select(.type == "approval/decided")]) as $decided
+    | (($events | length) == 2)
+      and (($groups | length) == 1)
+      and (($presets | length) >= 1)
+      and (($asked | length) == 1)
+      and (($decided | length) == 1)
+      and (($asked[0].data.id | type) == "string")
+      and (($asked[0].data.id | length) > 0)
+      and ($asked[0].data.id == $decided[0].data.id)
+      and (($presets[-1].seq | type) == "number")
+      and (($asked[0].seq | type) == "number")
+      and (($decided[0].seq | type) == "number")
+      and ($presets[-1].seq < $asked[0].seq)
+      and ($asked[0].seq < $decided[0].seq)
+      and ($decided[0].data.outcome == "allowed-once")
   '
+test "$DSH_ACCEPT_AUTO_TARGET" = "$HOME/.cache/dsh-auto-approve-acceptance-auto-$DSH_ACCEPT_AUTO_ID.html"
+test -d "$HOME/.Trash"
+export DSH_ACCEPT_AUTO_TRASH="$HOME/.Trash/$(basename "$DSH_ACCEPT_AUTO_TARGET")"
+test ! -e "$DSH_ACCEPT_AUTO_TRASH"
+mv "$DSH_ACCEPT_AUTO_TARGET" "$DSH_ACCEPT_AUTO_TRASH"
+test ! -e "$DSH_ACCEPT_AUTO_TARGET"
+test -f "$DSH_ACCEPT_AUTO_TRASH"
 ```
 
-最后一条 `jq` 必须输出 `true`。同一次审批的 `approval/asked` 与 `approval/decided` 必须使用同一个 `data.id`，自动批准的 outcome 必须是 `allowed-once`。
+`jq` 必须输出 `true`：该 fresh session 的最后一个相关预设事件必须先固定为 `auto`，随后只能有一个审批 ID，且该 ID 下必须恰好有一条在先的 `approval/asked` 和一条在后的 `approval/decided`；自动批准的 outcome 必须是 `allowed-once`。最后几条命令重新核对完整路径，只把本节创建的单一临时文件移入废纸篓，保持可恢复。
 
 ## 4. Auto：危险命令必须转人工
 
-先确认安全哨兵路径不存在，再新建独立 session、选择 **Auto**，复制并发送下面的任务：
+先由宿主 shell 在 `$HOME` 下创建一个高熵哨兵目录，目录中只放一份可校验 marker。哨兵必须真实存在：`rm -rf` 删除不存在的路径会在受限沙箱内直接成功，无法触发升级审批；真实目录则会让初次沙箱执行因越界写入失败，随后进入插件的危险清单和人工 responder。
 
 ```bash
-export DSH_ACCEPT_DANGER_TARGET="/Users/ricksanchez/.dsh-auto-approve-acceptance-$(uuidgen | tr '[:upper:]' '[:lower:]')"
+export DSH_ACCEPT_DANGER_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+test "${#DSH_ACCEPT_DANGER_ID}" -eq 36
+case "$DSH_ACCEPT_DANGER_ID" in
+  *[!0-9a-f-]*|'') printf 'invalid danger id: %s\n' "$DSH_ACCEPT_DANGER_ID" >&2; exit 1 ;;
+esac
+export DSH_ACCEPT_DANGER_TARGET="$HOME/.dsh-auto-approve-acceptance-danger-$DSH_ACCEPT_DANGER_ID"
 case "$DSH_ACCEPT_DANGER_TARGET" in
-  /Users/ricksanchez/.dsh-auto-approve-acceptance-[0-9a-f-]*) ;;
+  "$HOME"/.dsh-auto-approve-acceptance-danger-*) ;;
   *) printf 'unexpected danger target: %s\n' "$DSH_ACCEPT_DANGER_TARGET" >&2; exit 1 ;;
 esac
+case "$DSH_ACCEPT_DANGER_TARGET" in
+  "$DSH_ACCEPT_REPO"|"$DSH_ACCEPT_REPO"/*)
+    printf 'danger target is inside the session workspace: %s\n' "$DSH_ACCEPT_DANGER_TARGET" >&2
+    exit 1
+    ;;
+esac
 test ! -e "$DSH_ACCEPT_DANGER_TARGET"
-printf '只请求执行一次 rm -rf %s；出现审批弹窗后停止等待，不要改写命令。' \
+export DSH_ACCEPT_DANGER_MARKER="$DSH_ACCEPT_DANGER_TARGET/marker.txt"
+test "$DSH_ACCEPT_DANGER_MARKER" = "$HOME/.dsh-auto-approve-acceptance-danger-$DSH_ACCEPT_DANGER_ID/marker.txt"
+mkdir -m 700 "$DSH_ACCEPT_DANGER_TARGET"
+printf '%s\n' "$DSH_ACCEPT_DANGER_ID" > "$DSH_ACCEPT_DANGER_MARKER"
+test -d "$DSH_ACCEPT_DANGER_TARGET"
+test -f "$DSH_ACCEPT_DANGER_MARKER"
+test "$(wc -l < "$DSH_ACCEPT_DANGER_MARKER" | tr -d ' ')" -eq 1
+test "$(sed -n '1p' "$DSH_ACCEPT_DANGER_MARKER")" = "$DSH_ACCEPT_DANGER_ID"
+printf "只请求执行下面这一条命令一次，不要改写命令：rm -rf -- '%s'；出现审批弹窗后停止等待。" \
   "$DSH_ACCEPT_DANGER_TARGET" | pbcopy
 ```
 
-通过条件：必须出现人工审批弹窗。点击 **Reject/拒绝**，不要批准。然后导出该 session 并核对拒绝审计：
+新建独立 session、选择 **Auto**，等选择器恢复可点击并仍显示 **Auto** 后再粘贴发送。通过条件：必须出现人工审批弹窗。点击 **Reject/拒绝**，不要批准。点击 **Session log** 下载该 session 的 ZIP，把绝对路径填入下面变量，严格核对拒绝审计，并确认哨兵目录和 marker 原封不动：
 
 ```bash
-export DSH_ACCEPT_DANGER_SESSION_ID='把危险命令 session UUID 粘贴到这里'
-test "$(printf '%s' "$DSH_ACCEPT_DANGER_SESSION_ID" | wc -c | tr -d ' ')" -eq 36
-curl --noproxy '*' -fsS \
-  "http://$DSH_ACCEPT_HOST:$DSH_ACCEPT_PORT/api/session.export?sessionId=$DSH_ACCEPT_DANGER_SESSION_ID&includeDescendants=false" \
-  -o "$DSH_ACCEPT_TMP/danger.zip"
-unzip -p "$DSH_ACCEPT_TMP/danger.zip" session.jsonl |
+export DSH_ACCEPT_DANGER_ZIP='/Users/ricksanchez/Downloads/dsh-session-把实际文件名补完整.zip'
+test -f "$DSH_ACCEPT_DANGER_ZIP"
+unzip -tq "$DSH_ACCEPT_DANGER_ZIP" session.jsonl
+unzip -p "$DSH_ACCEPT_DANGER_ZIP" session.jsonl |
   jq -s -e '
-    [.[] | select(.type == "approval/asked" or .type == "approval/decided")] as $a
-    | ($a | length) == 2
-      and $a[-2].type == "approval/asked"
-      and $a[-1].type == "approval/decided"
-      and $a[-2].data.id == $a[-1].data.id
-      and $a[-1].data.outcome == "rejected"
+    [.[] | select(.type == "permission/preset" and .data.preset == "auto")] as $presets
+    | [.[] | select(.type == "approval/asked" or .type == "approval/decided")] as $events
+    | ($events | group_by(.data.id)) as $groups
+    | ($groups[0] // []) as $group
+    | ([$group[] | select(.type == "approval/asked")]) as $asked
+    | ([$group[] | select(.type == "approval/decided")]) as $decided
+    | (($events | length) == 2)
+      and (($groups | length) == 1)
+      and (($presets | length) >= 1)
+      and (($asked | length) == 1)
+      and (($decided | length) == 1)
+      and (($asked[0].data.id | type) == "string")
+      and (($asked[0].data.id | length) > 0)
+      and ($asked[0].data.id == $decided[0].data.id)
+      and (($presets[-1].seq | type) == "number")
+      and (($asked[0].seq | type) == "number")
+      and (($decided[0].seq | type) == "number")
+      and ($presets[-1].seq < $asked[0].seq)
+      and ($asked[0].seq < $decided[0].seq)
+      and ($decided[0].data.outcome == "rejected")
   '
-test ! -e "$DSH_ACCEPT_DANGER_TARGET"
+test "$DSH_ACCEPT_DANGER_TARGET" = "$HOME/.dsh-auto-approve-acceptance-danger-$DSH_ACCEPT_DANGER_ID"
+test "$DSH_ACCEPT_DANGER_MARKER" = "$DSH_ACCEPT_DANGER_TARGET/marker.txt"
+test -d "$DSH_ACCEPT_DANGER_TARGET"
+test -f "$DSH_ACCEPT_DANGER_MARKER"
+test "$(wc -l < "$DSH_ACCEPT_DANGER_MARKER" | tr -d ' ')" -eq 1
+test "$(sed -n '1p' "$DSH_ACCEPT_DANGER_MARKER")" = "$DSH_ACCEPT_DANGER_ID"
 ```
 
-两条断言都必须成功；危险清单命中不得进入自动批准出口。
+审计与完整性断言都必须成功；危险清单命中不得进入自动批准出口。最后把验收哨兵精确移入当前用户的废纸篓，而不是永久删除；需要时可从废纸篓恢复：
+
+```bash
+test -d "$HOME/.Trash"
+export DSH_ACCEPT_DANGER_TRASH="$HOME/.Trash/$(basename "$DSH_ACCEPT_DANGER_TARGET")"
+test "$DSH_ACCEPT_DANGER_TRASH" = "$HOME/.Trash/.dsh-auto-approve-acceptance-danger-$DSH_ACCEPT_DANGER_ID"
+test ! -e "$DSH_ACCEPT_DANGER_TRASH"
+mv "$DSH_ACCEPT_DANGER_TARGET" "$DSH_ACCEPT_DANGER_TRASH"
+test ! -e "$DSH_ACCEPT_DANGER_TARGET"
+test -f "$DSH_ACCEPT_DANGER_TRASH/marker.txt"
+test "$(sed -n '1p' "$DSH_ACCEPT_DANGER_TRASH/marker.txt")" = "$DSH_ACCEPT_DANGER_ID"
+```
 
 ## 5. Workspace Write：行为与未安装插件时一致
 
-新建独立 session，选择 **Workspace Write**，再次发送与第 3 节完全相同的只读联网任务：
+生成另一个位于工作区外且不存在的精确目标。新建独立 session，工作区仍设为 `$DSH_ACCEPT_REPO`，选择 **Workspace Write**，再发送与第 3 节等价的联网下载任务：
 
 ```bash
-printf '%s' '只执行一次 curl -sS --max-time 10 https://example.com，不要使用管道、不要写文件；返回 HTML title 后停止。' | pbcopy
+export DSH_ACCEPT_WORKSPACE_ID="$(uuidgen | tr '[:upper:]' '[:lower:]')"
+test "${#DSH_ACCEPT_WORKSPACE_ID}" -eq 36
+case "$DSH_ACCEPT_WORKSPACE_ID" in
+  *[!0-9a-f-]*|'') printf 'invalid workspace id: %s\n' "$DSH_ACCEPT_WORKSPACE_ID" >&2; exit 1 ;;
+esac
+test -d "$HOME/.cache"
+export DSH_ACCEPT_WORKSPACE_TARGET="$HOME/.cache/dsh-auto-approve-acceptance-workspace-$DSH_ACCEPT_WORKSPACE_ID.html"
+case "$DSH_ACCEPT_WORKSPACE_TARGET" in
+  "$HOME"/.cache/dsh-auto-approve-acceptance-workspace-*.html) ;;
+  *) printf 'unexpected workspace target: %s\n' "$DSH_ACCEPT_WORKSPACE_TARGET" >&2; exit 1 ;;
+esac
+case "$DSH_ACCEPT_WORKSPACE_TARGET" in
+  "$DSH_ACCEPT_REPO"|"$DSH_ACCEPT_REPO"/*)
+    printf 'workspace target is inside the session workspace: %s\n' "$DSH_ACCEPT_WORKSPACE_TARGET" >&2
+    exit 1
+    ;;
+esac
+test ! -e "$DSH_ACCEPT_WORKSPACE_TARGET"
+printf '%s' "只执行下面这一条命令一次，不要改写命令，也不要运行任何其他命令：curl -fsS --location --max-time 20 https://example.com -o '$DSH_ACCEPT_WORKSPACE_TARGET'。出现审批弹窗后停止等待。" | pbcopy
 ```
 
-通过条件：与未安装本插件的原生 `workspace-write + approval: ask` 一样，必须出现人工审批弹窗。点击 **Reject/拒绝**，再执行：
+选择 **Workspace Write** 后必须等选择器恢复可点击并仍显示 **Workspace Write**，再发送任务；不能在禁用/加载状态发送。通过条件：与未安装本插件的原生 `workspace-write + approval: ask` 一样，必须出现人工审批弹窗。点击 **Reject/拒绝**，再点击 **Session log** 下载 ZIP，把绝对路径填入下面变量并执行：
 
 ```bash
-export DSH_ACCEPT_WORKSPACE_SESSION_ID='把 Workspace Write session UUID 粘贴到这里'
-test "$(printf '%s' "$DSH_ACCEPT_WORKSPACE_SESSION_ID" | wc -c | tr -d ' ')" -eq 36
-curl --noproxy '*' -fsS \
-  "http://$DSH_ACCEPT_HOST:$DSH_ACCEPT_PORT/api/session.export?sessionId=$DSH_ACCEPT_WORKSPACE_SESSION_ID&includeDescendants=false" \
-  -o "$DSH_ACCEPT_TMP/workspace-write.zip"
-unzip -p "$DSH_ACCEPT_TMP/workspace-write.zip" session.jsonl |
+export DSH_ACCEPT_WORKSPACE_ZIP='/Users/ricksanchez/Downloads/dsh-session-把实际文件名补完整.zip'
+test -f "$DSH_ACCEPT_WORKSPACE_ZIP"
+unzip -tq "$DSH_ACCEPT_WORKSPACE_ZIP" session.jsonl
+unzip -p "$DSH_ACCEPT_WORKSPACE_ZIP" session.jsonl |
   jq -s -e '
-    [.[] | select(.type == "approval/asked" or .type == "approval/decided")] as $a
-    | ($a | length) == 2
-      and $a[-2].type == "approval/asked"
-      and $a[-1].type == "approval/decided"
-      and $a[-2].data.id == $a[-1].data.id
-      and $a[-1].data.outcome == "rejected"
+    [.[] | select(.type == "permission/preset" and .data.preset == "workspace-write")] as $presets
+    | [.[] | select(.type == "approval/asked" or .type == "approval/decided")] as $events
+    | ($events | group_by(.data.id)) as $groups
+    | ($groups[0] // []) as $group
+    | ([$group[] | select(.type == "approval/asked")]) as $asked
+    | ([$group[] | select(.type == "approval/decided")]) as $decided
+    | (($events | length) == 2)
+      and (($groups | length) == 1)
+      and (($presets | length) >= 1)
+      and (($asked | length) == 1)
+      and (($decided | length) == 1)
+      and (($asked[0].data.id | type) == "string")
+      and (($asked[0].data.id | length) > 0)
+      and ($asked[0].data.id == $decided[0].data.id)
+      and (($presets[-1].seq | type) == "number")
+      and (($asked[0].seq | type) == "number")
+      and (($decided[0].seq | type) == "number")
+      and ($presets[-1].seq < $asked[0].seq)
+      and ($asked[0].seq < $decided[0].seq)
+      and ($decided[0].data.outcome == "rejected")
   '
+test "$DSH_ACCEPT_WORKSPACE_TARGET" = "$HOME/.cache/dsh-auto-approve-acceptance-workspace-$DSH_ACCEPT_WORKSPACE_ID.html"
+test ! -e "$DSH_ACCEPT_WORKSPACE_TARGET"
 ```
 
 `jq` 必须输出 `true`。这证明非 `auto` 预设仍由宿主人工 responder 处理。
