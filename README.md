@@ -1,5 +1,8 @@
 # dsh-auto-approve
 
+[![test](https://github.com/Jiao-XXX/dsh-auto-approve/actions/workflows/test.yml/badge.svg)](https://github.com/Jiao-XXX/dsh-auto-approve/actions/workflows/test.yml)
+[![license: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](./LICENSE)
+
 中文 | [English](#english)
 
 `dsh-auto-approve` 为 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 增加 `Auto` 权限档。在该档位下，分类模型可以对例行的沙箱升级做一次性批准；命中确定性危险规则、模型拿不准、超时、响应格式错误或插件内部异常时，审批仍会交给正常的人工弹窗。

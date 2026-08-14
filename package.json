@@ -21,6 +21,14 @@
     "security"
   ],
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Jiao-XXX/dsh-auto-approve.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Jiao-XXX/dsh-auto-approve/issues"
+  },
+  "homepage": "https://github.com/Jiao-XXX/dsh-auto-approve#readme",
   "engines": {
     "node": ">=22.19.0"
   },
