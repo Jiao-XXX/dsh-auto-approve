@@ -199,8 +199,11 @@ function validateEventEnvelope(event, expectedSeq, sourceName, lineNumber) {
   if (!Number.isSafeInteger(event.time)) {
     fail(sourceName, lineNumber, 'event.time 必须是安全整数')
   }
-  if (!isRecord(event.data)) {
-    fail(sourceName, lineNumber, 'event.data 必须是对象')
+  // SessionEventMap is merge-extensible: a plugin-owned event may carry any
+  // JSON value, including null or a primitive. Event-specific branches below
+  // validate an object only for the core records this analyzer consumes.
+  if (!Object.hasOwn(event, 'data')) {
+    fail(sourceName, lineNumber, 'event.data 必须存在')
   }
   if (event.ignorable !== undefined && event.ignorable !== true) {
     fail(sourceName, lineNumber, 'event.ignorable 只允许 true 或省略')
@@ -364,7 +367,8 @@ export function parseSessionJsonl(content, sourceName = '<session.jsonl>') {
 
     if (event.type === 'approval/asked') {
       const allowedKeys = ['id', 'toolName', 'callId', 'reason']
-      if (Object.keys(event.data).some(key => !allowedKeys.includes(key))) {
+      if (!isRecord(event.data)
+        || Object.keys(event.data).some(key => !allowedKeys.includes(key))) {
         fail(sourceName, lineNumber, 'approval/asked.data 含未知字段')
       }
       if (typeof event.data.id !== 'string' || event.data.id.length === 0
@@ -402,7 +406,7 @@ export function parseSessionJsonl(content, sourceName = '<session.jsonl>') {
     }
 
     if (event.type === 'user/message') {
-      if (event.data.role !== 'user' || !isRecord(event.data.source)
+      if (!isRecord(event.data) || event.data.role !== 'user' || !isRecord(event.data.source)
         || typeof event.data.source.kind !== 'string') {
         fail(sourceName, lineNumber, 'user/message 必须带 role="user" 与 source.kind')
       }
@@ -579,8 +583,19 @@ export function analyzeSessions(sessions, customPatterns = []) {
 
   const patternCritiques = customPatterns.map(pattern => {
     const logHits = ownedApprovals.filter(({ approval }) => pattern.regexp.test(approval.evidence)).length
-    const redundant = isNonEmptySubset(matchingProbeSet(pattern.regexp), BUILTIN_PROBE_SET)
-    return Object.freeze({ source: pattern.source, inputIndex: pattern.inputIndex, logHits, redundant, possiblyDead: logHits === 0 })
+    const probeHits = matchingProbeSet(pattern.regexp)
+    const redundant = isNonEmptySubset(probeHits, BUILTIN_PROBE_SET)
+    const insufficientSamples = ownedApprovals.length === 0
+    const possiblyDead = !insufficientSamples && logHits === 0 && probeHits.size === 0
+    return Object.freeze({
+      source: pattern.source,
+      inputIndex: pattern.inputIndex,
+      logHits,
+      redundant,
+      unobserved: logHits === 0,
+      insufficientSamples,
+      possiblyDead,
+    })
   })
 
   return Object.freeze({
@@ -651,7 +666,9 @@ export function renderReport(analysis) {
     for (const critique of analysis.patternCritiques) {
       const notes = []
       if (critique.redundant) notes.push('样例命令集上的非空命中全部被内置危险清单覆盖，可能冗余')
-      if (critique.possiblyDead) notes.push('全部日志零命中，可能是死正则')
+      if (critique.insufficientSamples) notes.push('审批样本为空，无法根据日志判断是否为死正则')
+      else if (critique.possiblyDead) notes.push('日志与样例命令集均零命中，可能是死正则')
+      else if (critique.unobserved) notes.push('日志中未观察到命中')
       if (notes.length === 0) notes.push('未发现上述冗余或死正则信号')
       lines.push(`- ${quoted(critique.source)}：日志命中 ${critique.logHits} 条；${notes.join('；')}`)
     }

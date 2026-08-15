@@ -99,6 +99,19 @@ test('parses rc.6 packed chunk rows while keeping approval seq and callId correl
   assert.deepEqual(parsed.warnings, [])
 })
 
+test('accepts arbitrary JSON data on plugin-owned events it does not consume', () => {
+  const parsed = parseSessionJsonl(jsonl([
+    header({ id: 'plugin-data' }),
+    event('plugin/null', 0, null),
+    event('plugin/string', 1, 'primitive'),
+    event('plugin/number', 2, 42, { ignorable: true }),
+  ]), 'plugin-data.jsonl')
+
+  assert.equal(parsed.eventCount, 3)
+  assert.deepEqual(parsed.approvals, [])
+  assert.deepEqual(parsed.warnings, [])
+})
+
 test('pairs interleaved approvals strictly by id instead of adjacency', () => {
   const parsed = parseSessionJsonl(jsonl([
     header(),
@@ -270,10 +283,14 @@ test('reports built-in danger matches without attributing the responder', () => 
     event('turn/end', 4, { turn: 1, reason: { kind: 'completed' } }),
   ]))
   const report = renderReport(analyzeSessions([parsed]))
+  const reportBody = report.split('\n').slice(REPORT_NOTICE.length).join('\n')
 
   assert.match(report, /内置危险清单命中/)
   assert.ok(report.includes(JSON.stringify(DEFAULT_DANGER_PATTERNS[0])))
-  assert.doesNotMatch(report, /自动拒绝|人工拒绝/)
+  assert.doesNotMatch(
+    reportBody,
+    /(?:自动|人工)(?:批准|拒绝)|(?:auto(?:matically)?|human|manual)[ -]?(?:approval|approved|rejection|rejected)/iu,
+  )
 })
 
 test('compiles custom patterns with runtime flags, de-duplicates strings, and preserves input indexes', () => {
@@ -287,7 +304,7 @@ test('compiles custom patterns with runtime flags, de-duplicates strings, and pr
   )
 })
 
-test('critiques exact built-in-equivalent probe coverage and zero-log custom patterns', () => {
+test('separates unobserved and insufficient samples from a possibly dead pattern', () => {
   const gitForceSource = DEFAULT_DANGER_PATTERNS[3]
   const addsBenignSample = `(?:${gitForceSource})|\\bnpm\\s+install\\b`
   const patterns = compileExtraDangerPatterns([
@@ -295,18 +312,32 @@ test('critiques exact built-in-equivalent probe coverage and zero-log custom pat
     addsBenignSample,
     'this-will-never-match-7f5b',
   ])
-  const parsed = parseSessionJsonl(jsonl([header({ id: 'empty' })]))
-  const analysis = analyzeSessions([parsed], patterns)
+  const empty = parseSessionJsonl(jsonl([header({ id: 'empty' })]))
+  const emptyAnalysis = analyzeSessions([empty], patterns)
 
-  assert.equal(analysis.patternCritiques[0].redundant, true)
-  assert.equal(analysis.patternCritiques[0].possiblyDead, true)
-  assert.equal(analysis.patternCritiques[1].redundant, false)
-  assert.equal(analysis.patternCritiques[1].possiblyDead, true)
-  assert.equal(analysis.patternCritiques[2].redundant, false)
-  assert.equal(analysis.patternCritiques[2].possiblyDead, true)
-  const report = renderReport(analysis)
-  assert.match(report, /非空命中全部被内置危险清单覆盖，可能冗余/)
-  assert.match(report, /全部日志零命中，可能是死正则/)
+  assert.equal(emptyAnalysis.patternCritiques[0].redundant, true)
+  assert.equal(emptyAnalysis.patternCritiques[0].unobserved, true)
+  assert.equal(emptyAnalysis.patternCritiques[0].possiblyDead, false)
+  assert.equal(emptyAnalysis.patternCritiques[2].insufficientSamples, true)
+  const emptyReport = renderReport(emptyAnalysis)
+  assert.match(emptyReport, /非空命中全部被内置危险清单覆盖，可能冗余/)
+  assert.match(emptyReport, /审批样本为空，无法根据日志判断是否为死正则/)
+  assert.doesNotMatch(emptyReport, /日志与样例命令集均零命中/)
+
+  const observed = parseSessionJsonl(jsonl([
+    header({ id: 'observed' }),
+    event('turn/start', 0, { turn: 1 }),
+    toolCall(1, 'call-observed', 'npm install sample'),
+    asked(2, 'approval-observed', 'call-observed'),
+    decided(3, 'approval-observed'),
+    event('turn/end', 4, { turn: 1, reason: { kind: 'completed' } }),
+  ]))
+  const observedAnalysis = analyzeSessions([observed], patterns)
+  assert.equal(observedAnalysis.patternCritiques[0].unobserved, true)
+  assert.equal(observedAnalysis.patternCritiques[0].possiblyDead, false)
+  assert.equal(observedAnalysis.patternCritiques[1].logHits, 1)
+  assert.equal(observedAnalysis.patternCritiques[2].possiblyDead, true)
+  assert.match(renderReport(observedAnalysis), /日志与样例命令集均零命中，可能是死正则/)
 })
 
 test('report starts with the fixed provenance warning and has exact no-custom critique', () => {
@@ -355,6 +386,29 @@ test('deduplicates append-only exports of one session and rejects divergent same
     ]),
     /不是 append-only 前缀/,
   )
+})
+
+test('CLI counts repeated append-only exports of one session only once', async () => {
+  const shortContent = jsonl([header({ id: 'cli-repeated' })])
+  const longContent = `${shortContent}${JSON.stringify(event('permission/preset', 0, { preset: 'auto' }))}\n`
+  const files = new Map([
+    ['short.jsonl', shortContent],
+    ['long.jsonl', longContent],
+  ])
+  let stdout = ''
+  let stderr = ''
+
+  const exitCode = await runCli(['short.jsonl', 'long.jsonl'], {
+    stdout: { write: value => { stdout += value } },
+    stderr: { write: value => { stderr += value } },
+    readFile: async path => files.get(path),
+  })
+
+  assert.equal(exitCode, 0)
+  assert.match(stdout, /会话文件：1/)
+  assert.match(stdout, /展开后事件：1/)
+  assert.match(stderr, /多个 append-only 快照/)
+  assert.match(stderr, /仅统计较长的 long\.jsonl/)
 })
 
 test('CLI no-argument and invalid-pattern failures are explicit and return exit 1', async () => {
@@ -406,5 +460,9 @@ test('CLI reads multiple plaintext logs, emits warnings to stderr, and never cla
   assert.equal(exitCode, 0)
   assert.match(stdout, /会话文件：2/)
   assert.match(stdout, /无法区分自动批准或人工批准/)
+  assert.doesNotMatch(
+    stdout.split('\n').slice(REPORT_NOTICE.length).join('\n'),
+    /(?:自动|人工)(?:批准|拒绝)|(?:auto(?:matically)?|human|manual)[ -]?(?:approval|approved|rejection|rejected)/iu,
+  )
   assert.match(stderr, /尚未 decided/)
 })
