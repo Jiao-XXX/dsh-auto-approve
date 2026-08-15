@@ -36,14 +36,14 @@
 
 收到 `auto` 档的 `approval/request` 后，插件会：
 
-1. 从内存中的会话日志找回对应 `tool/call` 的原始参数，并读取最新一条真人用户消息：只接受 `user/message` 中 `source.kind === "user"` 的文本，忽略插件消息，最多取 2000 个字符。
+1. 从内存中的会话日志找回对应 `tool/call` 的原始参数，并读取最新一条真人用户消息：只接受 `user/message` 中 `source.kind === "user"` 的文本，忽略插件消息。消息不超过 2000 个字符时完整加入证据；超过上限则不截断猜测，直接转人工。
 2. 先用确定性危险清单检查 justification 和工具参数；混淆熔断会把带命令替换或进程替换的破坏性命令直接交给人工。
 3. 把命令、justification、目标沙箱模式、工作区路径和 `latestUserMessage` 交给配置的分类模型。真人消息里的明确授权可帮助判定具体操作，但命令示例和引用本身不算执行授权。
 4. 只有模型严格返回 `{"verdict":"approve"}` 时才返回 `allowed-once`；其他情况全部交给下一位应答者，通常就是 Web UI。
 
 内置危险清单覆盖破坏性 `rm -rf` 目标、设备写入与格式化、强制推送、下载后直接送入 shell、破坏性 SQL、主机关机、对根路径递归 `chmod 777`、shell fork 炸弹、Terraform/Pulumi 销毁，以及把 `rm`、`dd`、`mkfs`、`chmod` 或 `chown` 与 `$()`、反引号或 `<()` 组合的混淆写法。LLM 无法推翻已经命中的危险规则。
 
-普通 `git push` 到用户自己的 fork 或工作分支属于例行候选；推送到 `main`、`master`、`release`、`production`、`prod` 或其他共享/生产类分支应转人工。force push 无论目标分支为何都会在分类前命中危险清单。
+普通 `git push` 到用户自己的 fork 或工作分支属于例行候选；推送到 `main`、`master`、`release`、`production`、`prod` 或其他共享/生产类分支应转人工。`--force` / `-f` / `--mirror`、前导 `+refspec` 以及 `git -C ... push --force` 等 force-push 标准写法，无论目标分支为何都会在分类前命中危险清单。
 
 ## 安装
 
@@ -149,7 +149,7 @@ npm run tune -- \
 
 本插件减少的是审批弹窗，并不能证明一条命令绝对安全。命令、justification 和其他审批字段都是不可信的模型输入；只有最新一条 `source.kind === "user"` 的真人消息被作为可信任务上下文，而且其中的命令示例或引用仍不等于执行授权。默认 `classifierPrompt` 会明确这条边界，严格输出解析也会安全回退；如果完整替换该提示，请自行保留同等的严格 JSON 与数据隔离约束。提示注入与分类错误仍然存在。确定性清单始终优先执行，不过有限的正则无法覆盖所有破坏性写法和间接副作用。
 
-需要逐次人工确认时请使用 `workspace-write`。应为敏感工具追加部署专属危险规则；除非明确要替换整套内置保护，否则保持 `dangerPatterns: null`。分类请求会把命令、justification、目标沙箱模式、工作区路径和最多 2000 字符的最新真人用户消息发送给最终解析出的 LLM provider，请将这一点纳入数据处理策略。
+需要逐次人工确认时请使用 `workspace-write`。应为敏感工具追加部署专属危险规则；除非明确要替换整套内置保护，否则保持 `dangerPatterns: null`。分类请求会把命令、justification、目标沙箱模式、工作区路径和不超过 2000 字符的最新真人用户消息发送给最终解析出的 LLM provider；更长的真人消息不会被截断发送，而是直接转人工。请将这一点纳入数据处理策略。
 
 ## 已知限制
 
@@ -247,14 +247,14 @@ Think of it as DeepSeek Harness's counterpart to [Claude Code's **auto mode**](h
 
 For each `approval/request` in the `auto` preset, the plugin:
 
-1. Recovers the raw `tool/call` arguments from the in-memory session log and reads the newest genuine user message: only text from a `user/message` whose `source.kind === "user"` is accepted, plugin messages are ignored, and the value is capped at 2,000 characters.
+1. Recovers the raw `tool/call` arguments from the in-memory session log and reads the newest genuine user message: only text from a `user/message` whose `source.kind === "user"` is accepted, and plugin messages are ignored. Messages up to 2,000 characters are included in full; a longer message is not truncated and guessed from, but sent directly to human review.
 2. Checks the justification and tool arguments against a deterministic danger list; a confusion circuit breaker sends destructive commands that use command or process substitution directly to a human.
 3. Sends the command, justification, target sandbox mode, workspace path, and `latestUserMessage` to the configured classifier model. Explicit authorization in the genuine user message can inform the concrete decision, but command examples or quotations alone are not execution authorization.
 4. Returns `allowed-once` only for the exact response `{"verdict":"approve"}`. Every other result delegates to the next responder, normally the Web UI.
 
 The built-in danger list covers destructive `rm -rf` targets, device writes and formatting, force-pushes, download-to-shell pipelines, destructive SQL, host shutdown, root-wide `chmod 777`, the shell fork bomb, Terraform/Pulumi destruction, and obfuscated combinations of `rm`, `dd`, `mkfs`, `chmod`, or `chown` with `$()`, backticks, or `<()`. A model verdict can never override a danger-list match.
 
-An ordinary `git push` to the user's own fork or working branch is a routine candidate. Pushes to `main`, `master`, `release`, `production`, `prod`, or another shared/production-like branch should go to a human. A force-push hits the danger list before classification regardless of its target branch.
+An ordinary `git push` to the user's own fork or working branch is a routine candidate. Pushes to `main`, `master`, `release`, `production`, `prod`, or another shared/production-like branch should go to a human. Standard force-push forms—including `--force`, `-f`, `--mirror`, a leading `+refspec`, and `git -C ... push --force`—hit the danger list before classification regardless of the target branch.
 
 ### Install
 
@@ -360,7 +360,7 @@ Duplicate rules are deduplicated; an invalid regular expression reports an error
 
 This plugin reduces approval prompts; it does not prove that a command is safe. The command, justification, and other approval fields are untrusted model input. Only the newest genuine message with `source.kind === "user"` is trusted task context, and command examples or quotations inside it still do not constitute execution authorization. The default `classifierPrompt` states that boundary, and strict output parsing fails closed. If you replace the complete prompt, preserve equivalent strict-JSON and data-isolation constraints. Prompt injection and classifier mistakes remain possible. The deterministic list is intentionally evaluated first, yet no finite regular-expression list covers every destructive spelling or indirect effect.
 
-Use `workspace-write` when every escalation must receive human review. Add deployment-specific danger patterns for sensitive tools, and leave `dangerPatterns: null` unless you intend to replace the complete built-in protection. The classification request sends the command, justification, sandbox target, workspace path, and up to 2,000 characters of the newest genuine user message to the resolved LLM provider; account for that in your data-handling policy.
+Use `workspace-write` when every escalation must receive human review. Add deployment-specific danger patterns for sensitive tools, and leave `dangerPatterns: null` unless you intend to replace the complete built-in protection. The classification request sends the command, justification, sandbox target, workspace path, and the complete newest genuine user message when it is at most 2,000 characters to the resolved LLM provider. A longer message is not sent in truncated form and instead goes directly to human review; account for that in your data-handling policy.
 
 ### Known limitations
 

@@ -459,4 +459,4 @@ delete window.__dshAutoApproveAcceptance
 } | tee "$DSH_ACCEPT_TMP/acceptance-summary.txt"
 ```
 
-发布记录应至少包含：82 项测试全绿、dump-config 四档断言通过、真人明确授权的 Auto 例行任务为 `allowed-once`、危险命令与 Workspace Write 均转人工、`/auto-report` 的 session 隔离与重启清空通过、调优脚本未虚构批准者、图标显示与静默自禁用/恢复通过。
+发布记录应至少包含：88 项测试全绿、dump-config 四档断言通过、真人明确授权的 Auto 例行任务为 `allowed-once`、危险命令与 Workspace Write 均转人工、`/auto-report` 的 session 隔离与重启清空通过、调优脚本未虚构批准者、图标显示与静默自禁用/恢复通过。
