@@ -7,7 +7,7 @@ export const DEFAULT_DANGER_PATTERNS = Object.freeze([
   String.raw`\brm\s+(?:-[a-z]*r[a-z]*f[a-z]*|-[a-z]*f[a-z]*r[a-z]*)\s+(?:--\s+)?["']?(?:/|~)(?:[^\s"';&|]*)["']?`,
   String.raw`\bdd\b[^\n;&|]*\bof\s*=\s*["']?/dev/`,
   String.raw`\bmkfs(?:\.[a-z0-9_-]+)?\b`,
-  String.raw`\bgit\s+push\b[^\n;&|]*(?:--force\b|-f\b)`,
+  String.raw`\bgit(?:\s+(?!push\b)[^\s;&|]+)*\s+push\b[^\n;&|]*(?:--force\b|-f\b|--mirror\b|(?:^|[\s"'])\+[^\s"';&|]+)`,
   String.raw`\b(?:curl|wget)\b[^\n|]*\|\s*(?:/usr/bin/env\s+)?(?:ba|z|da|k)?sh\b`,
   String.raw`\bdrop\s+(?:database|table)\b`,
   String.raw`\btruncate\b`,

@@ -115,7 +115,7 @@ function findToolArguments(events, callId) {
   return undefined
 }
 
-/** Extract bounded text from the newest genuine user message, never plugin context. */
+/** Extract the newest genuine user text, flagging overflow instead of truncating trusted context. */
 function latestUserMessage(events) {
   for (let index = events.length - 1; index >= 0; index -= 1) {
     const event = events[index]
@@ -124,20 +124,24 @@ function latestUserMessage(events) {
     if (message === null || typeof message !== 'object' || message.source?.kind !== 'user') continue
     // This is the newest genuine user message. If it is image-only or malformed,
     // returning null is safer than attaching an older task to the current ask.
-    if (!Array.isArray(message.content)) return null
+    if (!Array.isArray(message.content)) {
+      return Object.freeze({ text: null, tooLong: false })
+    }
     let text = ''
     let sawText = false
     for (const block of message.content) {
       if (block === null || typeof block !== 'object'
         || block.type !== 'text' || typeof block.text !== 'string') continue
       const part = `${sawText ? '\n' : ''}${block.text}`
-      const remaining = LATEST_USER_MESSAGE_MAX_CHARS - text.length
-      if (remaining > 0) text += part.slice(0, remaining)
+      if (text.length + part.length > LATEST_USER_MESSAGE_MAX_CHARS) {
+        return Object.freeze({ text: null, tooLong: true })
+      }
+      text += part
       sawText = true
     }
-    return sawText ? text : null
+    return Object.freeze({ text: sawText ? text : null, tooLong: false })
   }
-  return null
+  return Object.freeze({ text: null, tooLong: false })
 }
 
 function commandFromArguments(argumentsText) {
@@ -251,7 +255,7 @@ function nextWithSignal(iterator, signal) {
   })
 }
 
-async function collectClassifierText(llm, options, signal) {
+async function collectClassifierText(llm, options, signal, trackIteratorCleanup) {
   const iterator = llm.stream(options)[Symbol.asyncIterator]()
   const blocks = new Map()
   const blockOrder = []
@@ -329,11 +333,11 @@ async function collectClassifierText(llm, options, signal) {
     }
   } finally {
     if (!completed) {
-      try {
-        await iterator.return?.()
-      } catch {
+      const cleanup = Promise.resolve().then(() => iterator.return?.()).catch(() => {
         // The call is already falling back to manual review; cleanup failure cannot approve it.
-      }
+      })
+      if (typeof trackIteratorCleanup === 'function') trackIteratorCleanup(cleanup)
+      else void cleanup
     }
   }
   signal.throwIfAborted()
@@ -353,7 +357,7 @@ async function collectClassifierText(llm, options, signal) {
     : { verdict, detail: verdict }
 }
 
-async function classify(ctx, req, config, evidence, lifetimeSignal) {
+async function classify(ctx, req, config, evidence, lifetimeSignal, trackIteratorCleanup) {
   if (lifetimeSignal?.aborted) return { verdict: 'ask', detail: 'unloaded' }
   if (req.signal !== undefined && !(req.signal instanceof AbortSignal)) {
     return { verdict: 'ask', detail: 'invalid-signal' }
@@ -393,7 +397,7 @@ async function classify(ctx, req, config, evidence, lifetimeSignal) {
       sessionId: req.agent.session.id,
       signal,
     })
-    return await collectClassifierText(llm, options, signal)
+    return await collectClassifierText(llm, options, signal, trackIteratorCleanup)
   } catch {
     if (signal?.aborted) {
       if (lifetimeSignal?.aborted && signal.reason === lifetimeSignal.reason) {
@@ -428,11 +432,17 @@ export function createApprovalHandler(ctx, config, patterns, lifecycle = {}) {
     ?? (operation => Promise.resolve().then(operation))
   const lifetimeSignal = lifecycle.signal
   const recordDecision = lifecycle.recordDecision
+  const trackIteratorCleanup = lifecycle.trackIteratorCleanup
   return async (req, next) => {
     let command
     let reportCommand
     let categorized = false
     let autoPreset = false
+    let delegated = false
+    const delegate = () => {
+      delegated = true
+      return next()
+    }
     const record = (category, detail) => {
       categorized = true
       safelyRecordDecision(recordDecision, req, reportCommand, category, detail)
@@ -444,13 +454,13 @@ export function createApprovalHandler(ctx, config, patterns, lifecycle = {}) {
         // request to Auto's report when it may belong to another preset.
         categorized = true
         logDecision(ctx, 'manual', `verdict=${initialCancellation}`)
-        return next()
+        return delegate()
       }
 
       const session = req.agent.session
       const events = session.events
       if (ctx.get('permissionPresets')?.current(events) !== config.presetName) {
-        return next()
+        return delegate()
       }
       autoPreset = true
 
@@ -462,14 +472,21 @@ export function createApprovalHandler(ctx, config, patterns, lifecycle = {}) {
       if (danger !== undefined) {
         record('danger', `pattern=${danger.source}`)
         logDecision(ctx, 'manual', `pattern=${JSON.stringify(danger.source)}`)
-        return next()
+        return delegate()
       }
 
       const beforeClassification = cancellationDetail(req, lifetimeSignal)
       if (beforeClassification !== undefined) {
         record('classifier-manual', `verdict=${beforeClassification}`)
         logDecision(ctx, 'manual', `verdict=${beforeClassification}`)
-        return next()
+        return delegate()
+      }
+
+      const userMessage = latestUserMessage(events)
+      if (userMessage.tooLong) {
+        record('classifier-manual', 'verdict=latest-user-message-too-long')
+        logDecision(ctx, 'manual', 'verdict=latest-user-message-too-long')
+        return delegate()
       }
 
       const decision = await trackClassification(() => classify(ctx, req, config, {
@@ -479,36 +496,37 @@ export function createApprovalHandler(ctx, config, patterns, lifecycle = {}) {
         justification: reason,
         targetSandboxMode: targetSandboxMode(reason),
         workspacePath: session.header?.cwd ?? null,
-        latestUserMessage: latestUserMessage(events),
-      }, lifetimeSignal))
+        latestUserMessage: userMessage.text,
+      }, lifetimeSignal, trackIteratorCleanup))
       if (decision.verdict === 'approve') {
         const afterClassification = cancellationDetail(req, lifetimeSignal)
         if (afterClassification !== undefined) {
           record('classifier-manual', `verdict=${afterClassification}`)
           logDecision(ctx, 'manual', `verdict=${afterClassification}`)
-          return next()
+          return delegate()
         }
         logDecision(ctx, 'auto-approve', 'verdict=approve')
         const afterLogging = cancellationDetail(req, lifetimeSignal)
         if (afterLogging !== undefined) {
           record('classifier-manual', `verdict=${afterLogging}`)
           logDecision(ctx, 'manual', `verdict=${afterLogging}`)
-          return next()
+          return delegate()
         }
         record('auto-approved', 'verdict=approve')
         return 'allowed-once'
       }
       record('classifier-manual', `verdict=${decision.detail}`)
       logDecision(ctx, 'manual', `verdict=${decision.detail}`)
-      return next()
-    } catch {
+      return delegate()
+    } catch (error) {
+      if (delegated) throw error
       if (!categorized && autoPreset) record('classifier-manual', 'verdict=internal-error')
       try {
         logDecision(ctx, 'manual', 'verdict=internal-error')
       } catch {
         // A broken logger must not replace the required manual fallback with a rejection.
       }
-      return next()
+      return delegate()
     }
   }
 }
@@ -522,6 +540,7 @@ export function apply(ctx, config = {}) {
   ctx.effect(() => {
     const lifetime = new AbortController()
     const activeClassifications = new Set()
+    const activeIteratorCleanups = new Set()
 
     function trackClassification(operation) {
       let tracked
@@ -530,11 +549,18 @@ export function apply(ctx, config = {}) {
       return tracked
     }
 
+    function trackIteratorCleanup(cleanup) {
+      let tracked
+      tracked = Promise.resolve(cleanup).finally(() => activeIteratorCleanups.delete(tracked))
+      activeIteratorCleanups.add(tracked)
+    }
+
     const disposeListener = ctx.on(
       'approval/request',
       createApprovalHandler(ctx, resolved, patterns, {
         signal: lifetime.signal,
         trackClassification,
+        trackIteratorCleanup,
         recordDecision: row => { appendReportRow(reportBySession, row) },
       }),
       { prepend: true },
@@ -547,6 +573,7 @@ export function apply(ctx, config = {}) {
       }
       lifetime.abort(new Error('dsh-auto-approve plugin unloaded'))
       await Promise.allSettled([...activeClassifications])
+      await Promise.allSettled([...activeIteratorCleanups])
       reportBySession.clear()
     }
   }, 'dsh-auto-approve: abort and drain active classifications')
