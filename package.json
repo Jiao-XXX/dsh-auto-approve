@@ -1,7 +1,7 @@
 {
   "name": "dsh-auto-approve",
-  "version": "0.3.0",
-  "description": "A conservative automatic approval preset for DeepSeek Harness sandbox escalations",
+  "version": "0.4.0",
+  "description": "为 DeepSeek Harness 增加介于 Workspace Write 与 Full access 之间的自动批准权限档：例行沙箱升级由分类模型一次性放行，危险或不确定的操作仍转人工审批。An auto-approval permission preset for DeepSeek Harness between workspace-write and full access: routine sandbox escalations are granted once by a classifier, while dangerous or uncertain requests still go to a human.",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -12,21 +12,35 @@
   "files": [
     "index.js",
     "client.js",
+    "danger-patterns.js",
     "assets",
     "docs",
+    "scripts",
     "cordis.patch.yml",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "test": "node --test"
+    "test": "node --test",
+    "tune": "node scripts/tune-from-logs.mjs"
   },
   "keywords": [
     "deepseek-harness",
     "dsh",
     "dsh-plugin",
+    "deepseek",
     "permissions",
-    "security"
+    "permission-preset",
+    "approval",
+    "auto-approve",
+    "sandbox",
+    "escalation",
+    "security",
+    "自动批准",
+    "权限预设",
+    "沙箱",
+    "审批",
+    "安全"
   ],
   "license": "MIT",
   "repository": {

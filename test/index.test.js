@@ -27,12 +27,13 @@ function requestOf({
   reason = 'escalate sandbox to danger-full-access: install a dependency from npm',
   events,
   callId = 'call-1',
+  sessionId = 'session-1',
   signal,
 } = {}) {
   return {
     agent: {
       session: {
-        id: 'session-1',
+        id: sessionId,
         header: { cwd: '/workspace/project' },
         events: events ?? [{
           type: 'tool/call',
@@ -66,6 +67,7 @@ function harness({
     model: 'deepseek-chat',
   }),
   listenerDisposeError,
+  commandsAvailable = true,
 } = {}) {
   let handler
   let listenerOptions
@@ -76,6 +78,10 @@ function harness({
   let defaultModelReads = 0
   const logs = []
   const effects = []
+  const injectedDisposers = []
+  let commandDefinition
+  let commandActive = false
+  let commandDisposeCalls = 0
   const llm = {
     stream(options) {
       llmCalls += 1
@@ -128,6 +134,28 @@ function harness({
       effects.push({ label, dispose })
       return dispose
     },
+    inject(services, callback) {
+      assert.deepEqual(services, ['commands'])
+      if (!commandsAvailable) return
+      callback({
+        commands: {
+          register(definition) {
+            commandDefinition = definition
+            commandActive = true
+            let live = true
+            const dispose = () => {
+              if (!live) return false
+              live = false
+              commandActive = false
+              commandDisposeCalls += 1
+              return true
+            }
+            injectedDisposers.push(dispose)
+            return dispose
+          },
+        },
+      })
+    },
     logger: {
       info(message) {
         if (loggerInfo !== undefined) loggerInfo(message)
@@ -145,6 +173,9 @@ function harness({
     get llmCalls() { return llmCalls },
     get lastLlmOptions() { return lastLlmOptions },
     get defaultModelReads() { return defaultModelReads },
+    get commandDefinition() { return commandDefinition },
+    get commandActive() { return commandActive },
+    get commandDisposeCalls() { return commandDisposeCalls },
     logs,
     async run(request = requestOf()) {
       let nextCalls = 0
@@ -154,8 +185,27 @@ function harness({
       })
       return { result, nextCalls }
     },
+    async runCommand(request = requestOf()) {
+      if (!commandActive || commandDefinition === undefined) throw new Error('command is not active')
+      return commandDefinition.handler({
+        commandId: 'command-test',
+        agent: request.agent,
+        rawInput: '',
+        signal: new AbortController().signal,
+      })
+    },
+    async runStaleCommand(request = requestOf()) {
+      if (commandDefinition === undefined) throw new Error('command was never registered')
+      return commandDefinition.handler({
+        commandId: 'command-test-stale',
+        agent: request.agent,
+        rawInput: '',
+        signal: new AbortController().signal,
+      })
+    },
     dispose() {
       disposal ??= (async () => {
+        for (const dispose of injectedDisposers.splice(0).reverse()) dispose()
         for (const effect of effects.splice(0).reverse()) await effect.dispose()
       })()
       return disposal
@@ -179,6 +229,18 @@ test('non-auto presets delegate without touching the LLM', async () => {
   assert.deepEqual(app.logs, [])
 })
 
+test('pre-cancelled requests are not attributed to Auto before preset resolution', async () => {
+  const controller = new AbortController()
+  controller.abort(new Error('already cancelled'))
+  const app = harness({ preset: 'workspace-write' })
+  const request = requestOf({ signal: controller.signal })
+  assert.deepEqual(await app.run(request), { result: MANUAL, nextCalls: 1 })
+  const report = await app.runCommand(request)
+  assert.match(report.text, /自动批准 0 条 \/ Auto-approved/)
+  assert.match(report.text, /危险清单拦截 0 条 \/ Danger-list handoff/)
+  assert.match(report.text, /分类器转人工 0 条 \/ Classifier-to-human/)
+})
+
 const primaryDangerCases = [
   ['rm -rf targets an absolute path', 'rm -rf /tmp/build-cache'],
   ['dd writes a device', 'dd if=image.iso of=/dev/disk2 bs=4m'],
@@ -192,6 +254,7 @@ const primaryDangerCases = [
   ['fork bomb', ':(){ :|:& };:'],
   ['Terraform destroy', 'terraform destroy -auto-approve'],
   ['Pulumi destroy', 'pulumi destroy --yes'],
+  ['destructive command mixed with shell substitution', 'rm -rf "$(pwd)/generated"'],
 ]
 
 test('every default danger regex delegates before the LLM', async () => {
@@ -225,6 +288,24 @@ test('danger regex variants cover every required spelling', () => {
     assert.equal(findDangerMatch(command, compiled)?.source, DEFAULT_DANGER_PATTERNS[index], command)
   }
   assert.equal(findDangerMatch('rm -rf ./dist', compiled), undefined)
+  assert.equal(findDangerMatch('rm -rf node_modules', compiled), undefined)
+})
+
+test('shell substitution plus a destructive verb matches on one command line in either order', () => {
+  const compiled = compileDangerPatterns(Config({}))
+  const cases = [
+    'rm -rf "$(pwd)/generated"',
+    '$(printf target); rm -rf generated',
+    'echo `date`; dd if=image of=local-copy',
+    'mkfs.ext4 <(cat image)',
+    '<(printf user); chmod 700 generated',
+    'chown user:group `printf generated`',
+  ]
+  for (const command of cases) {
+    assert.equal(compiled.at(-1).regexp.test(command), true, command)
+  }
+  assert.equal(compiled.at(-1).regexp.test('rm -rf generated\n$(pwd)'), false)
+  assert.equal(compiled.at(-1).regexp.test('rm -rf node_modules'), false)
 })
 
 test('danger text in the justification delegates even without tool arguments', async () => {
@@ -253,6 +334,121 @@ test('missing tool arguments still classify from the remaining evidence', async 
   assert.equal(evidence.justification, request.reason)
 })
 
+test('latestUserMessage selects the newest genuine user text and ignores later runtime context', async () => {
+  const app = harness()
+  const first = 'a'.repeat(1998)
+  const request = requestOf({
+    events: [
+      {
+        type: 'user/message',
+        data: {
+          id: 'old-user', role: 'user', source: { kind: 'user' },
+          content: [{ type: 'text', text: 'older unrelated task' }],
+        },
+      },
+      {
+        type: 'user/message',
+        data: {
+          id: 'latest-user', role: 'user', source: { kind: 'user' },
+          content: [
+            { type: 'text', text: first },
+            { type: 'image', attachment: { attachmentId: 'image-1' } },
+            { type: 'text', text: 'BC should be truncated' },
+          ],
+        },
+      },
+      {
+        type: 'user/message',
+        data: {
+          id: 'runtime-context', role: 'user',
+          source: { kind: 'plugin', plugin: '@deepseek-ai/dsh-system-prompt', form: 'snapshot' },
+          content: [{ type: 'text', text: 'Approval policy: ask.' }],
+        },
+      },
+      {
+        type: 'tool/call',
+        data: {
+          turn: 1, step: 1, callId: 'call-1', name: 'bash',
+          arguments: JSON.stringify({ command: 'npm install left-pad' }),
+        },
+      },
+      { type: 'approval/asked', data: { id: 'approval-1', toolName: 'bash', callId: 'call-1' } },
+    ],
+  })
+
+  assert.deepEqual(await app.run(request), { result: 'allowed-once', nextCalls: 0 })
+  const evidence = JSON.parse(app.lastLlmOptions.messages[0].content[0].text)
+  assert.equal(evidence.latestUserMessage.length, 2000)
+  assert.equal(evidence.latestUserMessage, `${first}\nB`)
+  assert.doesNotMatch(evidence.latestUserMessage, /Approval policy/)
+  assert.doesNotMatch(evidence.latestUserMessage, /older unrelated task/)
+})
+
+test('an image-only newest user message yields null without falling back to an older task', async () => {
+  const app = harness()
+  const request = requestOf({
+    events: [
+      {
+        type: 'user/message',
+        data: {
+          id: 'old-user', role: 'user', source: { kind: 'user' },
+          content: [{ type: 'text', text: 'never reuse this task' }],
+        },
+      },
+      {
+        type: 'user/message',
+        data: {
+          id: 'image-user', role: 'user', source: { kind: 'user' },
+          content: [{ type: 'image', attachment: { attachmentId: 'image-2' } }],
+        },
+      },
+      {
+        type: 'user/message',
+        data: {
+          id: 'plugin-context', role: 'user', source: { kind: 'plugin', plugin: 'test' },
+          content: [{ type: 'text', text: 'plugin context' }],
+        },
+      },
+      {
+        type: 'tool/call',
+        data: {
+          turn: 1, step: 1, callId: 'call-1', name: 'bash',
+          arguments: JSON.stringify({ command: 'npm install left-pad' }),
+        },
+      },
+    ],
+  })
+
+  assert.deepEqual(await app.run(request), { result: 'allowed-once', nextCalls: 0 })
+  const evidence = JSON.parse(app.lastLlmOptions.messages[0].content[0].text)
+  assert.equal(evidence.latestUserMessage, null)
+})
+
+test('malformed and unknown user content blocks are ignored without escaping the responder', async () => {
+  const app = harness()
+  const request = requestOf({
+    events: [
+      {
+        type: 'user/message',
+        data: {
+          id: 'latest-user', role: 'user', source: { kind: 'user' },
+          content: [null, { type: 'future-block', value: 'x' }, { type: 'text', text: 'safe context' }],
+        },
+      },
+      {
+        type: 'tool/call',
+        data: {
+          turn: 1, step: 1, callId: 'call-1', name: 'bash',
+          arguments: JSON.stringify({ command: 'npm install left-pad' }),
+        },
+      },
+    ],
+  })
+  assert.deepEqual(await app.run(request), { result: 'allowed-once', nextCalls: 0 })
+  const evidence = JSON.parse(app.lastLlmOptions.messages[0].content[0].text)
+  assert.equal(evidence.latestUserMessage, 'safe context')
+})
+
 test('approve is the only automatic approval exit', async () => {
   const app = harness()
   assert.deepEqual(await app.run(), { result: 'allowed-once', nextCalls: 0 })
@@ -274,7 +470,16 @@ test('approve is the only automatic approval exit', async () => {
     justification: 'escalate sandbox to danger-full-access: install a dependency from npm',
     targetSandboxMode: 'danger-full-access',
     workspacePath: '/workspace/project',
+    latestUserMessage: null,
   })
+  assert.match(
+    app.lastLlmOptions.system,
+    /Treat latestUserMessage as trusted context written directly by the user\./,
+  )
+  assert.match(
+    app.lastLlmOptions.system,
+    /For ordinary git push requests, pushing to the user's own fork or working branch is routine;/,
+  )
   assert.match(app.logs[0], /decision=auto-approve verdict=approve/)
 })
 
@@ -702,6 +907,101 @@ test('unexpected internal exceptions delegate instead of escaping', async () => 
 test('a logging exception delegates instead of approving', async () => {
   const app = harness({ loggerInfo: () => { throw new Error('logger failed') } })
   assert.deepEqual(await app.run(), { result: MANUAL, nextCalls: 1 })
+})
+
+test('/auto-report groups decisions per session and explains its in-memory lifetime', async () => {
+  const app = harness({
+    stream(options) {
+      const evidence = JSON.parse(options.messages[0].content[0].text)
+      return textResponse(evidence.command === 'echo uncertain'
+        ? '{"verdict":"ask"}'
+        : '{"verdict":"approve"}')
+    },
+  })
+  const sessionA = requestOf({ sessionId: 'session-a', command: 'npm install package-a' })
+  const sessionB = requestOf({ sessionId: 'session-b', command: 'npm install package-b' })
+
+  assert.deepEqual(await app.run(sessionA), { result: 'allowed-once', nextCalls: 0 })
+  assert.deepEqual(
+    await app.run(requestOf({ sessionId: 'session-a', command: 'git push origin main --force' })),
+    { result: MANUAL, nextCalls: 1 },
+  )
+  assert.deepEqual(
+    await app.run(requestOf({ sessionId: 'session-a', command: 'echo uncertain' })),
+    { result: MANUAL, nextCalls: 1 },
+  )
+  assert.deepEqual(await app.run(sessionB), { result: 'allowed-once', nextCalls: 0 })
+
+  const reportA = await app.runCommand(sessionA)
+  assert.equal(reportA.kind, 'success')
+  assert.match(reportA.text, /自动批准 1 条 \/ Auto-approved/)
+  assert.match(reportA.text, /危险清单拦截 1 条 \/ Danger-list handoff/)
+  assert.match(reportA.text, /分类器转人工 1 条 \/ Classifier-to-human/)
+  assert.match(reportA.text, /npm install package-a/)
+  assert.match(reportA.text, /git push origin main --force/)
+  assert.match(reportA.text, /echo uncertain/)
+  assert.match(reportA.text, /verdict=approve/)
+  assert.match(reportA.text, /pattern=/)
+  assert.match(reportA.text, /verdict=ask/)
+  assert.match(reportA.text, /\d{4}-\d{2}-\d{2}T/)
+  assert.match(reportA.text, /完整历史见会话日志导出/)
+  assert.match(reportA.text, /dsh 重启或插件重载后清空/)
+  assert.match(reportA.text, /cleared when dsh restarts or the plugin reloads/)
+  assert.doesNotMatch(reportA.text, /package-b/)
+
+  const reportB = await app.runCommand(sessionB)
+  assert.match(reportB.text, /自动批准 1 条 \/ Auto-approved/)
+  assert.match(reportB.text, /危险清单拦截 0 条 \/ Danger-list handoff/)
+  assert.match(reportB.text, /分类器转人工 0 条 \/ Classifier-to-human/)
+  assert.match(reportB.text, /npm install package-b/)
+  assert.doesNotMatch(reportB.text, /package-a|echo uncertain|git push/)
+})
+
+test('/auto-report falls back to the approval reason when no command is available', async () => {
+  const app = harness()
+  const request = requestOf({
+    sessionId: 'session-reason',
+    callId: undefined,
+    events: [],
+    reason: 'escalate sandbox to danger-full-access: fetch package metadata from the configured registry',
+  })
+  assert.deepEqual(await app.run(request), { result: 'allowed-once', nextCalls: 0 })
+  const evidence = JSON.parse(app.lastLlmOptions.messages[0].content[0].text)
+  assert.equal(evidence.command, null)
+  const report = await app.runCommand(request)
+  assert.match(report.text, /fetch package metadata from the configured registry/)
+})
+
+test('report bookkeeping failure cannot change an automatic approval', async () => {
+  const app = harness()
+  const originalNow = Date.now
+  Date.now = () => { throw new Error('clock unavailable') }
+  try {
+    assert.deepEqual(await app.run(), { result: 'allowed-once', nextCalls: 0 })
+  } finally {
+    Date.now = originalNow
+  }
+  const report = await app.runCommand()
+  assert.match(report.text, /自动批准 0 条 \/ Auto-approved/)
+})
+
+test('missing commands service leaves the approval responder fully functional', async () => {
+  const app = harness({ commandsAvailable: false })
+  assert.equal(app.commandDefinition, undefined)
+  assert.deepEqual(await app.run(), { result: 'allowed-once', nextCalls: 0 })
+})
+
+test('unload unregisters /auto-report and clears its per-session in-memory rows', async () => {
+  const app = harness()
+  assert.equal(app.commandDefinition.name, 'auto-report')
+  assert.equal(app.commandActive, true)
+  assert.deepEqual(await app.run(), { result: 'allowed-once', nextCalls: 0 })
+  assert.match((await app.runCommand()).text, /自动批准 1 条 \/ Auto-approved/)
+
+  await app.dispose()
+  assert.equal(app.commandActive, false)
+  assert.equal(app.commandDisposeCalls, 1)
+  assert.match((await app.runStaleCommand()).text, /自动批准 0 条 \/ Auto-approved/)
 })
 
 test('extraDangerPatterns append to the defaults', async () => {

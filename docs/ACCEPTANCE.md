@@ -57,7 +57,10 @@ cd /Users/ricksanchez/SmallProject/dsh-plugins
 cd "$DSH_ACCEPT_REPO"
 "$DSH_ACCEPT_NODE" --check index.js
 "$DSH_ACCEPT_NODE" --check client.js
+"$DSH_ACCEPT_NODE" --check danger-patterns.js
+"$DSH_ACCEPT_NODE" --check scripts/tune-from-logs.mjs
 npm test
+npm pack --dry-run --cache "$DSH_ACCEPT_TMP/npm-cache"
 git diff --check
 ```
 
@@ -124,11 +127,13 @@ assert.equal(config.timeoutMs, defaults.timeoutMs)
 assert.deepEqual(config.extraDangerPatterns, defaults.extraDangerPatterns)
 assert.equal(config.dangerPatterns, null)
 assert.match(config.classifierPrompt, /Return exactly one JSON object and nothing else/)
+assert.match(config.classifierPrompt, /Treat latestUserMessage as trusted context written directly by the user/)
+assert.match(config.classifierPrompt, /For ordinary git push requests/)
 console.log('dump-config: four presets and auto-approve config are exact')
 NODE
 ```
 
-## 3. Auto：例行联网与工作区外精确写入自动批准
+## 3. Auto：真人明确授权的例行联网与工作区外精确写入
 
 先生成一个位于 `$HOME/.cache`、明确不在 session 工作区和系统临时目录内的高熵目标。该文件不存在；验收命令同时需要联网和写入这个精确路径，因此必然经过一次沙箱升级审批。`~/.cache` 是本清单在 rc.6 真机验证过的例行缓存场景：
 
@@ -156,7 +161,7 @@ printf '%s' "$DSH_ACCEPT_REPO" | pbcopy
 
 1. 打开 `http://127.0.0.1:3080/`，新建一个独立 session；把刚复制的路径设为该 session 的工作区，并在界面确认工作区精确为 `/Users/ricksanchez/SmallProject/dsh-plugins/dsh-auto-approve`。
 2. 在 Permissions 选择器选择 **Auto**；等选择器恢复可点击并仍显示 **Auto** 后再继续，不能在切换仍处于禁用/加载状态时发送任务。
-3. 执行下面的命令，把**唯一允许执行的完整命令**复制到剪贴板；粘贴到会话并发送：
+3. 执行下面的命令，把**真人明确授权且唯一允许执行的完整命令**复制到剪贴板；直接粘贴到会话并发送，不要通过插件消息或命令示例代发：
 
 ```bash
 printf '%s' "只执行下面这一条命令一次，不要改写命令，也不要运行任何其他命令：curl -fsS --location --max-time 20 https://example.com -o '$DSH_ACCEPT_AUTO_TARGET'。命令结束后只报告退出码。" | pbcopy
@@ -176,6 +181,11 @@ unzip -p "$DSH_ACCEPT_AUTO_ZIP" session.jsonl |
 unzip -p "$DSH_ACCEPT_AUTO_ZIP" session.jsonl |
   jq -s -e '
     [.[] | select(.type == "permission/preset" and .data.preset == "auto")] as $presets
+    | [.[] | select(
+        .type == "user/message"
+        and .data.source.kind == "user"
+        and ([.data.content[]? | select(.type == "text") | .text] | join("\n") | contains("只执行下面这一条命令一次"))
+      )] as $human
     | [.[] | select(.type == "approval/asked" or .type == "approval/decided")] as $events
     | ($events | group_by(.data.id)) as $groups
     | ($groups[0] // []) as $group
@@ -184,15 +194,18 @@ unzip -p "$DSH_ACCEPT_AUTO_ZIP" session.jsonl |
     | (($events | length) == 2)
       and (($groups | length) == 1)
       and (($presets | length) >= 1)
+      and (($human | length) == 1)
       and (($asked | length) == 1)
       and (($decided | length) == 1)
       and (($asked[0].data.id | type) == "string")
       and (($asked[0].data.id | length) > 0)
       and ($asked[0].data.id == $decided[0].data.id)
       and (($presets[-1].seq | type) == "number")
+      and (($human[0].seq | type) == "number")
       and (($asked[0].seq | type) == "number")
       and (($decided[0].seq | type) == "number")
       and ($presets[-1].seq < $asked[0].seq)
+      and ($human[0].seq < $asked[0].seq)
       and ($asked[0].seq < $decided[0].seq)
       and ($decided[0].data.outcome == "allowed-once")
   '
@@ -205,7 +218,7 @@ test ! -e "$DSH_ACCEPT_AUTO_TARGET"
 test -f "$DSH_ACCEPT_AUTO_TRASH"
 ```
 
-`jq` 必须输出 `true`：该 fresh session 的最后一个相关预设事件必须先固定为 `auto`，随后只能有一个审批 ID，且该 ID 下必须恰好有一条在先的 `approval/asked` 和一条在后的 `approval/decided`；自动批准的 outcome 必须是 `allowed-once`。最后几条命令重新核对完整路径，只把本节创建的单一临时文件移入废纸篓，保持可恢复。
+`jq` 必须输出 `true`：该 fresh session 必须先记录明确授权的真人 `source.kind == "user"` 消息和 `auto` 预设，随后只能有一个审批 ID，且该 ID 下必须恰好有一条在先的 `approval/asked` 和一条在后的 `approval/decided`；本次无弹窗的一次性放行 outcome 必须是 `allowed-once`。会话事件本身不记录批准者身份，插件来源还要在第 6 节用 `/auto-report` 核对。最后几条命令重新核对完整路径，只把本节创建的单一临时文件移入废纸篓，保持可恢复。
 
 ## 4. Auto：危险命令必须转人工
 
@@ -352,7 +365,40 @@ test ! -e "$DSH_ACCEPT_WORKSPACE_TARGET"
 
 `jq` 必须输出 `true`。这证明非 `auto` 预设仍由宿主人工 responder 处理。
 
-## 6. 图标显示与静默自禁用
+## 6. `/auto-report`：会话隔离、重启清空与完整日志边界
+
+先回到第 3 节的 Auto session，把命令复制到剪贴板、粘贴发送：
+
+```bash
+printf '%s' '/auto-report' | pbcopy
+```
+
+报告必须包含 `Auto 权限审批台账 / Auto approval report for this session`、`自动批准 1 条 / Auto-approved`、`危险清单拦截 0 条 / Danger-list handoff`、`分类器转人工 0 条 / Classifier-to-human`，并列出第 3 节命令摘要。这里的 `Auto-approved` 来自插件本次运行的内存记录；不要仅凭 Session log 中的 `allowed-once` 猜测批准者。
+
+然后新建一个不执行其他任务的空白 session，在该新 session 再发送同一个 `/auto-report`。三组计数必须全部为 0，证明报告按 session 隔离，不会把第 3 节记录带进另一个会话。
+
+接着在运行 `dsh web` 的专用终端按 `Ctrl-C` 停止服务，并在同一终端重新执行以下完整命令：
+
+```bash
+export PATH='/opt/homebrew/opt/node/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin'
+export DSH_ACCEPT_BIN='/Users/ricksanchez/.npm/_npx/1e7f6d9597241db0/node_modules/.bin/dsh'
+cd /Users/ricksanchez/SmallProject/dsh-plugins
+"$DSH_ACCEPT_BIN" web --host 127.0.0.1 --port 3080
+```
+
+服务恢复后重新打开第 3 节的原 Auto session，再发送 `/auto-report`。三组计数此时也必须全部为 0，并显示报告会在 dsh 重启或插件 reload 后清空的提示。第 3 节下载的 Session log ZIP 仍应通过下面的完整日志与调优检查；这证明内存报告被清空不等于持久会话审计丢失：
+
+```bash
+unzip -p "$DSH_ACCEPT_AUTO_ZIP" session.jsonl > "$DSH_ACCEPT_TMP/auto-session.jsonl"
+test -s "$DSH_ACCEPT_TMP/auto-session.jsonl"
+npm run tune -- "$DSH_ACCEPT_TMP/auto-session.jsonl" > "$DSH_ACCEPT_TMP/tune-report.txt"
+rg -Fq '无法区分自动批准或人工批准' "$DSH_ACCEPT_TMP/tune-report.txt"
+rg -Fqx '未提供自定义规则，仅执行日志统计' "$DSH_ACCEPT_TMP/tune-report.txt"
+```
+
+调优输出只能把信号和规则列为人工复核候选，不得把 `allowed-once` 标成自动或人工来源。跨 session 的空报告、重启后的空报告、原 Session log 的审批对，以及上述两条调优声明必须同时成立。
+
+## 7. 图标显示与静默自禁用
 
 先选择 **Auto** 并打开 Permissions 菜单。在浏览器 DevTools Console 粘贴：
 
@@ -400,7 +446,7 @@ delete window.__dshAutoApproveAcceptance
 
 通过条件：不匹配时只有兼容层图标消失，Permissions 按钮、菜单和四档切换仍正常；恢复文案后图标自动回来。再重复第 3 节的 Auto 任务，确认视觉兼容层的自禁用与恢复均未改变审批语义。
 
-## 7. 记录结果
+## 8. 记录结果
 
 保存本次版本、提交、测试和临时证据路径：
 
@@ -413,4 +459,4 @@ delete window.__dshAutoApproveAcceptance
 } | tee "$DSH_ACCEPT_TMP/acceptance-summary.txt"
 ```
 
-发布记录应至少包含：56 项测试全绿、dump-config 四档断言通过、Auto 例行任务为 `allowed-once`、危险命令与 Workspace Write 均转人工、图标显示与静默自禁用/恢复通过。
+发布记录应至少包含：82 项测试全绿、dump-config 四档断言通过、真人明确授权的 Auto 例行任务为 `allowed-once`、危险命令与 Workspace Write 均转人工、`/auto-report` 的 session 隔离与重启清空通过、调优脚本未虚构批准者、图标显示与静默自禁用/恢复通过。
