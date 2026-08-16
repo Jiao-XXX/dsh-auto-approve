@@ -41,7 +41,7 @@ export const Config = Schema.object({
     Schema.const(null),
   ]).default(null),
   classifierPrompt: Schema.string().min(1).default(CLASSIFIER_SYSTEM_PROMPT),
-  timeoutMs: Schema.number().step(1).min(1).max(2_147_483_647).default(8000),
+  timeoutMs: Schema.number().step(1).min(1).max(2_147_483_647).default(15_000),
   extraDangerPatterns: Schema.array(Schema.string()).default([]),
   dangerPatterns: Schema.union([
     Schema.array(Schema.string()),

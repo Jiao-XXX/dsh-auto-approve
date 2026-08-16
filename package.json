@@ -1,6 +1,6 @@
 {
   "name": "dsh-auto-approve",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "为 DeepSeek Harness 增加介于 Workspace Write 与 Full access 之间的自动批准权限档：例行沙箱升级由分类模型一次性放行，危险或不确定的操作仍转人工审批。An auto-approval permission preset for DeepSeek Harness between workspace-write and full access: routine sandbox escalations are granted once by a classifier, while dangerous or uncertain requests still go to a human.",
   "type": "module",
   "main": "index.js",

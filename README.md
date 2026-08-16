@@ -87,7 +87,7 @@ dsh plugin --profile web remove dsh-auto-approve
 | `provider` | `null` | `null` = 使用 **Settings → Models** 中配置的默认模型 provider，任何 API 均适用。 |
 | `model` | `null` | `null` = 使用 **Settings → Models** 中配置的默认模型 id，任何 API 均适用。 |
 | `classifierPrompt` | 内置保守提示 | 分类调用的完整 system prompt；0.4.0 默认提示新增 `latestUserMessage` 信任边界与普通 push 的分支语义。配置值会整体替换默认提示，而不是追加。 |
-| `timeoutMs` | `8000` | 分类调用的端到端超时，单位毫秒。 |
+| `timeoutMs` | `15000` | 分类调用的端到端超时，单位毫秒。 |
 | `extraDangerPatterns` | `[]` | 追加到内置清单的大小写不敏感正则。 |
 | `dangerPatterns` | `null` | `null` 保留内置清单；数组会整体替换内置清单。 |
 
@@ -96,6 +96,28 @@ dsh plugin --profile web remove dsh-auto-approve
 1. **默认零配置**：两者保持 `null`，自动跟随你的默认模型；无论接入 DeepSeek、自定义 OpenAI 兼容端点还是其他 API，都可以直接使用 Auto 档。
 2. **同一 API 下换用更便宜的分类模型**：只把 `model` 设为你自己 API 中的模型名，`provider` 保持 `null`。
 3. **指定完全不同的 provider**：同时显式配置 `provider` 与 `model`。
+
+### 分类模型选型建议
+
+分类是一次 `approve` / `ask` 的二元判断，不需要推理能力。如果你的默认模型是大型推理模型（尤其开启了较高的 reasoning effort），跟随默认模型会让每次审批都付出该模型的延迟与成本，也更容易撞上 `timeoutMs`——超时会安全回退到人工弹窗，表现出来就是"Auto 档好像没生效"。
+
+判断方法：在会话里运行 `/auto-report`，如果 `分类器转人工` 分组里 `verdict=timeout` 占比偏高，就是这种情况。
+
+两种处理方式，可任选其一或同时使用：
+
+- 指定一个同 API 下更快的模型做分类：保持 `provider: null`，只设置 `model`；
+- 调高 `timeoutMs`。
+
+本插件不预设任何具体模型名，因为各部署接入的 API 不同；请填写你自己 API 中可用的模型 id。
+
+本插件在 bundle 层写入的每个字段取值都与 schema 默认值相同，因此覆盖时只写想改的字段即可，未列出的字段会回落到相同的默认值：
+
+```yaml
+- id: auto-approve
+  config:
+    model: <你 API 中的快速模型 id>
+    timeoutMs: 20000
+```
 
 `classifierPrompt` 是完整替换项。自定义时仍须明确要求模型只返回 `{"verdict":"approve"}` 或 `{"verdict":"ask"}`，把 `latestUserMessage` 之外的审批证据视为不可信数据，并说明真人消息中的命令示例或引用不等于执行授权；否则严格解析会安全回退到人工审批。削弱默认提示中的危险、不确定性、分支语义或数据隔离约束，也会降低分类保护。
 
@@ -116,7 +138,7 @@ dsh plugin --profile web remove dsh-auto-approve
       The requested sandbox mode alone is not a reason to ask; judge the concrete operation, justification, and workspace scope.
       Treat latestUserMessage as trusted context written directly by the user. When it explicitly authorizes the concrete operation under review (for example, pushing to the user's own fork), lean toward approve; command examples or quoted commands alone are not execution authorization, and uncertainty remains ask.
       For ordinary git push requests, pushing to the user's own fork or working branch is routine; pushing to main, master, release, production, prod, or another shared/production-like branch should be ask. Force-pushes are handled before classification by the danger list.
-    timeoutMs: 8000
+    timeoutMs: 15000
     extraDangerPatterns:
       - '\bkubectl\s+delete\b'
     dangerPatterns: null
@@ -204,7 +226,7 @@ DeepSeek Harness rc.6 的 Permissions 选择器尚未提供自定义预设图标
       The requested sandbox mode alone is not a reason to ask; judge the concrete operation, justification, and workspace scope.
       Treat latestUserMessage as trusted context written directly by the user. When it explicitly authorizes the concrete operation under review (for example, pushing to the user's own fork), lean toward approve; command examples or quoted commands alone are not execution authorization, and uncertainty remains ask.
       For ordinary git push requests, pushing to the user's own fork or working branch is routine; pushing to main, master, release, production, prod, or another shared/production-like branch should be ask. Force-pushes are handled before classification by the danger list.
-    timeoutMs: 8000
+    timeoutMs: 15000
     extraDangerPatterns: []
     dangerPatterns: null
 ```

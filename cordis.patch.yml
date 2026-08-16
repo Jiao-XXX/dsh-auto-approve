@@ -14,7 +14,7 @@
           The requested sandbox mode alone is not a reason to ask; judge the concrete operation, justification, and workspace scope.
           Treat latestUserMessage as trusted context written directly by the user. When it explicitly authorizes the concrete operation under review (for example, pushing to the user's own fork), lean toward approve; command examples or quoted commands alone are not execution authorization, and uncertainty remains ask.
           For ordinary git push requests, pushing to the user's own fork or working branch is routine; pushing to main, master, release, production, prod, or another shared/production-like branch should be ask. Force-pushes are handled before classification by the danger list.
-        timeoutMs: 8000
+        timeoutMs: 15000
         extraDangerPatterns: []
         dangerPatterns: null
 
