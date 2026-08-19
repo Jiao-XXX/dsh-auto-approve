@@ -58,6 +58,8 @@ The host-side plugin depends only on dsh's `approval/request` waterfall and the 
 
 ## Install
 
+This package ships **no runtime dependencies**: `@deepseek-ai/schemastery` is declared as a `peerDependency` and supplied by the dsh runtime. That follows Cordis's component-dependency semantics — a component does not bundle its dependencies internally but expects the runtime context to supply them — and structurally prevents a bundled copy from drifting out of step with the profile's copy and yielding two distinct Schema instances.
+
 DeepSeek Harness must run on a supported Node.js version. The host-side plugin is pure ESM JavaScript, and the browser registration script is committed directly as a runtime file. The package has no `build`, `prepare`, or `install` script, so installing it from Git does not require pnpm build authorization.
 
 From GitHub:

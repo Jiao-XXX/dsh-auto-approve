@@ -59,6 +59,8 @@
 
 DeepSeek Harness 需要运行在受支持的 Node.js 版本上。宿主侧插件为纯 ESM JavaScript，浏览器注册脚本也作为运行时文件随仓库直接提交。本包没有 `build`、`prepare` 或 `install` 脚本，因此从 Git 安装时不需要授权 pnpm 执行构建。
 
+本包**不携带任何运行时依赖**：`@deepseek-ai/schemastery` 声明为 `peerDependency`，由 dsh 运行时供给。这遵循 Cordis 的组件依赖语义——组件不内捆依赖，而是期待运行时上下文提供——从机制上杜绝插件自带副本与 profile 版本漂移后出现两份 Schema 实例的问题。
+
 从 GitHub 安装：
 
 ```bash
