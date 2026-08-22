@@ -211,6 +211,28 @@ Duplicate rules are deduplicated; an invalid regular expression reports an error
 
 This plugin reduces approval prompts; it does not prove that a command is safe. The command, justification, and other approval fields are untrusted model input. Only the newest genuine message with `source.kind === "user"` is trusted task context, and command examples or quotations inside it still do not constitute execution authorization. The default `classifierPrompt` states that boundary, and strict output parsing fails closed. If you replace the complete prompt, preserve equivalent strict-JSON and data-isolation constraints. Prompt injection and classifier mistakes remain possible. The deterministic list is intentionally evaluated first, yet no finite regular-expression list covers every destructive spelling or indirect effect.
 
+### What one automatic grant actually gives
+
+A dsh sandbox escalation has no path granularity: the only target a model can request is `danger-full-access`. Every automatic grant therefore means **that one command runs unconfined by the workspace sandbox**, not that the single directory it mentioned was opened. The grant is one-shot (`allowed-once`) and does not carry to the next command, but for the duration of that command there is no workspace confinement.
+
+### The runtime self-modification path
+
+Since 0.5.0 the default prompt approves writes inside the user's own tool and configuration directories, which includes dsh's own `~/.dsh/profiles/` and preset directories. Such writes **change which code dsh loads on its next boot**: adding a plugin row, installing a plugin from a registry or a git source, or inserting plugin rows into a preset are all auto-approved under the default configuration.
+
+This is a persistence and supply-chain path, and it is not bypassed but **configured open** — the shared shape of this failure mode is "a safeguard is relaxed for convenience, and behaviour then extends past the intended boundary", with no external compromise involved. The default takes this trade-off because the plugin's typical user is doing plugin and preset development; if your deployment does not need the agent to modify its own runtime, close it.
+
+Three ways to close it, pick one:
+
+```yaml
+- id: auto-approve
+  config:
+    extraDangerPatterns:
+      - '\bdsh\s+plugin\b[^\n]*\badd\b'          # installing a plugin into the runtime
+      - '\bnpm\s+(?:i|install)\b[^\n]*-g\b'      # global installs
+```
+
+Or switch to [the strict prompt](#the-strict-prompt-optional), or use `workspace-write` for those sessions.
+
 Use `workspace-write` when every escalation must receive human review. Add deployment-specific danger patterns for sensitive tools, and leave `dangerPatterns: null` unless you intend to replace the complete built-in protection. The classification request sends the command, justification, sandbox target, workspace path, and the complete newest genuine user message when it is at most 2,000 characters to the resolved LLM provider. A longer message is not sent in truncated form and instead goes directly to human review; account for that in your data-handling policy.
 
 ## Known limitations
