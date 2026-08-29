@@ -21,6 +21,7 @@ function isAllowedTemporaryPath(value) {
 
 function isOutsideWorkspace(raw, workspacePath) {
   const original = String(raw).replace(/^['"]|['"]$/g, '')
+  if (/^~[^\\/]/.test(original)) return true
   const value = original.startsWith('~/') || original.startsWith('~\\')
     ? path.join(os.homedir(), original.slice(2))
     : original

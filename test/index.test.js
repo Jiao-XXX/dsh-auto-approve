@@ -225,6 +225,9 @@ test('write scope detection handles normalized paths and no-space redirections',
   assert.notEqual(findOutsideWorkspaceWrite('echo x > /workspace/Project/out', '/workspace/project'), undefined)
   assert.equal(findOutsideWorkspaceWrite('cat < /etc/x', '/workspace/project'), undefined)
   assert.equal(findOutsideWorkspaceWrite('cat <<EOF', '/workspace/project'), undefined)
+  assert.notEqual(findOutsideWorkspaceWrite('echo x > ~/outside-file', '/workspace/project'), undefined)
+  assert.notEqual(findOutsideWorkspaceWrite('echo x > ~other-user/outside-file', '/workspace/project'), undefined)
+  assert.equal(findOutsideWorkspaceWrite('echo x > /tmp/out', '/workspace/project'), undefined)
 })
 
 test('edit and write outside workspace delegate before classification', async () => {
