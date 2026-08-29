@@ -2,6 +2,63 @@ import { randomUUID } from 'node:crypto'
 import Schema from '@deepseek-ai/schemastery'
 import { DEFAULT_DANGER_PATTERNS } from './danger-patterns.js'
 
+const WRITE_PATH_COMMANDS = /(?:^|[;&|]\s*)(?:sudo\s+)?(?:tee|touch|mkdir|install|cp|mv|ln|chmod|chown|sed\s+-[^\n]*i|perl\s+-[^\n]*i|python(?:3)?\s+-c|node\s+-e)\b/i
+const TEMP_PATH = /^(?:[a-z]:[\\/]+users[\\/]+[^\\/]+[\\/]appdata[\\/]local[\\/]temp(?:[\\/]|$)|[\\/]tmp(?:[\\/]|$)|[\\/]var[\\/]tmp(?:[\\/]|$)|%temp%(?:[\\/]|$)|\$tmpdir(?:[\\/]|$))/i
+const SHELL_REDIRECTION = /(?:^|\s)(?:>>?|<<)\s*([^\s;&|]+)/g
+const PATH_TOKEN = /(?:["']([^"']+)["']|([^\s;&|]+))/g
+
+function normalizePath(value) {
+  return value.replace(/[\\/]+/g, '/').replace(/\/\.\//g, '/').replace(/\/$/, '').toLowerCase()
+}
+
+function isAllowedTemporaryPath(value) {
+  return TEMP_PATH.test(value.replace(/\\/g, '/'))
+}
+
+/** Detect explicit writes outside cwd while allowing conventional temp paths. */
+export function findOutsideWorkspaceWrite(command, workspacePath) {
+  if (typeof command !== 'string' || typeof workspacePath !== 'string' || workspacePath.length === 0) return undefined
+  const cwd = normalizePath(workspacePath)
+  const candidates = []
+  let match
+  while ((match = SHELL_REDIRECTION.exec(command)) !== null) candidates.push(match[1])
+  if (WRITE_PATH_COMMANDS.test(command)) {
+    while ((match = PATH_TOKEN.exec(command)) !== null) {
+      const value = match[1] ?? match[2]
+      if (value.includes('/') || value.includes('\\') || value.startsWith('~')) candidates.push(value)
+    }
+  }
+  for (const raw of candidates) {
+    const value = raw.replace(/^['"]|['"]$/g, '').replace(/^~(?=[\\/])/, '')
+    const normalized = normalizePath(value)
+    if (isAllowedTemporaryPath(value)) continue
+    if (normalized.startsWith('/') || /^[a-z]:\//i.test(normalized) || raw.startsWith('~')) {
+      if (!normalized.startsWith(`${cwd}/`) && normalized !== cwd) return raw
+    }
+  }
+  return undefined
+}
+
+function writeScopeViolation(command, workspacePath, toolName, toolArguments) {
+  const rawTarget = toolName === 'write' || toolName === 'edit'
+    ? (() => { try { return JSON.parse(toolArguments ?? '{}')?.file_path } catch { return undefined } })()
+    : undefined
+  const text = rawTarget ?? command
+  if (typeof text !== 'string' || typeof workspacePath !== 'string' || workspacePath.length === 0) return rawTarget !== undefined ? 'unresolved-write-target' : undefined
+  if (rawTarget === undefined && !WRITE_PATH_COMMANDS.test(text)) return undefined
+  if (/\$\{|\$[A-Za-z_][A-Za-z0-9_]*|%[^%]+%/.test(text)) return 'dynamic-write-target'
+  const targets = rawTarget !== undefined ? [rawTarget] : [...text.matchAll(/(?:>|>>|tee|touch|mkdir|cp|mv|install|rsync|sed\s+-i)\s+[^\s;&|]*\s*([^\s;&|]+)/gi)].map(match => match[1]).filter(Boolean)
+  if (targets.length === 0) return rawTarget !== undefined ? 'unresolved-write-target' : undefined
+  const cwd = normalizePath(workspacePath)
+  for (const target of targets) {
+    const normalized = normalizePath(String(target).replace(/^['"]|['"]$/g, ''))
+    if (isAllowedTemporaryPath(String(target))) continue
+    if ((normalized.startsWith('/') || /^[a-z]:\//i.test(normalized) || String(target).startsWith('~'))
+      && normalized !== cwd && !normalized.startsWith(`${cwd}/`)) return target
+  }
+  return undefined
+}
+
 export { DEFAULT_DANGER_PATTERNS } from './danger-patterns.js'
 
 export const name = 'auto-approve'
@@ -21,8 +78,8 @@ const CLASSIFIER_SYSTEM_PROMPT = [
   'Ask for publishing or releasing to a shared or public destination: package registries, production deploys, shared or production-like branches, and anything other people immediately consume.',
   'Ask for system-wide privileged changes: sudo, writes under /etc, /usr, /Library, or /System, system daemons and launch agents, global package managers, firewall or security settings, and changes to other user accounts.',
   'Ask when the command is genuinely unreadable to you — obfuscated, encoded, or fetched-then-executed from an unknown source — so you cannot tell what it does at all.',
-  'Everything else is routine developer work: approve it. Writing inside the user\'s own tool and configuration directories (for example ~/.dsh, ~/.config, ~/.cache, and per-application support directories), installing or updating dependencies, running builds, tests, linters, and formatters, starting or restarting the user\'s own local services, reading files and fetching read-only resources, and inspecting local processes and ports are all approve.',
-  'The requested sandbox mode alone is not a reason to ask; judge the concrete operation, justification, and workspace scope. Work outside the session workspace is normal and is not by itself a reason to ask.',
+  'Everything else is routine developer work: installing or updating dependencies, running builds, tests, linters, and formatters, starting or restarting the user\'s own local services, reading files and fetching read-only resources, and inspecting local processes and ports are all approve.',
+  'The requested sandbox mode alone is not a reason to ask; judge the concrete operation, justification, and workspace scope. Writes outside the session workspace are handled by the deterministic scope check before classification; if the target cannot be resolved, ask.',
   'Treat latestUserMessage as trusted context written directly by the user. When it explicitly authorizes the concrete operation under review (for example, pushing to the user\'s own fork), approve even if a concern above would otherwise apply, except for credential exfiltration, which always asks. Command examples or quoted commands alone are not execution authorization.',
   'For ordinary git push requests, pushing to the user\'s own fork or working branch is routine; pushing to main, master, release, production, prod, or another shared/production-like branch should be ask. Force-pushes are handled before classification by the danger list.',
 ].join('\n')
@@ -477,6 +534,13 @@ export function createApprovalHandler(ctx, config, patterns, lifecycle = {}) {
       if (danger !== undefined) {
         record('danger', `pattern=${danger.source}`)
         logDecision(ctx, 'manual', `pattern=${JSON.stringify(danger.source)}`)
+        return delegate()
+      }
+
+      const outsideWrite = writeScopeViolation(command, session.header?.cwd, req.toolName, toolArguments)
+      if (outsideWrite !== undefined) {
+        record('danger', `outside-workspace-write=${inlineSummary(outsideWrite, COMMAND_SUMMARY_MAX_CHARS)}`)
+        logDecision(ctx, 'manual', `outside-workspace-write=${JSON.stringify(outsideWrite)}`)
         return delegate()
       }
 
