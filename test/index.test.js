@@ -6,6 +6,7 @@ import {
   apply,
   compileDangerPatterns,
   findDangerMatch,
+  findOutsideWorkspaceWrite,
   parseClassifierVerdict,
 } from '../index.js'
 
@@ -29,25 +30,28 @@ function requestOf({
   callId = 'call-1',
   sessionId = 'session-1',
   signal,
+  toolName = 'bash',
+  toolArguments,
+  cwd = '/workspace/project',
 } = {}) {
   return {
     agent: {
       session: {
         id: sessionId,
-        header: { cwd: '/workspace/project' },
+        header: { cwd },
         events: events ?? [{
           type: 'tool/call',
           data: {
             turn: 1,
             step: 1,
             callId,
-            name: 'bash',
-            arguments: JSON.stringify({ command }),
+            name: toolName,
+            arguments: toolArguments ?? JSON.stringify(toolName === 'bash' ? { command } : { file_path: command }),
           },
         }],
       },
     },
-    toolName: 'bash',
+    toolName,
     callId,
     reason,
     ...signal === undefined ? {} : { signal },
@@ -212,6 +216,59 @@ function harness({
     },
   }
 }
+
+test('write scope detection handles normalized paths and no-space redirections', () => {
+  for (const command of ['echo x > ../other/file', 'echo x>/etc/x', 'printf x>>/etc/x', 'touch /etc/x', 'mkdir -p /etc/x']) {
+    assert.notEqual(findOutsideWorkspaceWrite(command, '/workspace/project'), undefined, command)
+  }
+  assert.equal(findOutsideWorkspaceWrite('echo x > /workspace/project/src/../out', '/workspace/project'), undefined)
+  assert.notEqual(findOutsideWorkspaceWrite('echo x > /workspace/Project/out', '/workspace/project'), undefined)
+  assert.equal(findOutsideWorkspaceWrite('cat < /etc/x', '/workspace/project'), undefined)
+  assert.equal(findOutsideWorkspaceWrite('cat <<EOF', '/workspace/project'), undefined)
+})
+
+test('edit and write outside workspace delegate before classification', async () => {
+  for (const toolName of ['edit', 'write']) {
+    for (const filePath of ['/etc/x', '../other/file', '/workspace/project/../../etc/x', '/workspace/project2/x', '~/outside-file']) {
+      const app = harness()
+      const request = requestOf({ toolName, command: filePath })
+      assert.deepEqual(await app.run(request), { result: MANUAL, nextCalls: 1 }, `${toolName} ${filePath}`)
+      assert.equal(app.llmCalls, 0, `${toolName} ${filePath}`)
+    }
+  }
+})
+
+test('missing workspace and interpreter commands fail closed before classification', async () => {
+  for (const [command, cwd] of [
+    ['echo x>/etc/x', null],
+    ['python -c "open(\'/etc/x\', \'w\').write(\'x\')"', '/workspace/project'],
+    ['node -e "fs.writeFileSync(\'/etc/x\', \'x\')"', '/workspace/project'],
+  ]) {
+    const app = harness()
+    const request = requestOf({ command, cwd: cwd ?? '/workspace/project' })
+    if (cwd === null) request.agent.session.header.cwd = undefined
+    assert.deepEqual(await app.run(request), { result: MANUAL, nextCalls: 1 }, command)
+    assert.equal(app.llmCalls, 0, command)
+  }
+})
+
+test('edit and write inside workspace retain automatic classification', async () => {
+  for (const toolName of ['edit', 'write']) {
+    const app = harness()
+    const request = requestOf({ toolName, command: 'src/../output.txt' })
+    assert.deepEqual(await app.run(request), { result: 'allowed-once', nextCalls: 0 }, toolName)
+    assert.equal(app.llmCalls, 1, toolName)
+  }
+})
+
+test('malformed edit and write arguments fail closed', async () => {
+  for (const toolArguments of ['{', JSON.stringify({}), JSON.stringify({ file_path: 42 })]) {
+    const app = harness()
+    const request = requestOf({ toolName: 'edit', command: 'ignored', toolArguments })
+    assert.deepEqual(await app.run(request), { result: MANUAL, nextCalls: 1 })
+    assert.equal(app.llmCalls, 0)
+  }
+})
 
 test('registers ahead of the Web responder', () => {
   const app = harness()

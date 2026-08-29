@@ -1,62 +1,91 @@
 import { randomUUID } from 'node:crypto'
+import path from 'node:path'
+import os from 'node:os'
 import Schema from '@deepseek-ai/schemastery'
 import { DEFAULT_DANGER_PATTERNS } from './danger-patterns.js'
 
-const WRITE_PATH_COMMANDS = /(?:^|[;&|]\s*)(?:sudo\s+)?(?:tee|touch|mkdir|install|cp|mv|ln|chmod|chown|sed\s+-[^\n]*i|perl\s+-[^\n]*i|python(?:3)?\s+-c|node\s+-e)\b/i
+const WRITE_PATH_COMMANDS = /(?:^|[;&|]\s*)(?:sudo\s+)?(?:tee|touch|mkdir|install|cp|mv|ln|chmod|chown|sed\s+-[^\n]*i|perl\s+-[^\n]*i)\b/i
+const DYNAMIC_WRITE_COMMANDS = /(?:^|[^\w])(?:sudo\s+)?(?:python(?:3)?\s+-c|node\s+-e|(?:ba|z|k)?sh\s+-c|powershell(?:\.exe)?\s+-command|pwsh\s+-command|xargs)\b/i
 const TEMP_PATH = /^(?:[a-z]:[\\/]+users[\\/]+[^\\/]+[\\/]appdata[\\/]local[\\/]temp(?:[\\/]|$)|[\\/]tmp(?:[\\/]|$)|[\\/]var[\\/]tmp(?:[\\/]|$)|%temp%(?:[\\/]|$)|\$tmpdir(?:[\\/]|$))/i
-const SHELL_REDIRECTION = /(?:^|\s)(?:>>?|<<)\s*([^\s;&|]+)/g
-const PATH_TOKEN = /(?:["']([^"']+)["']|([^\s;&|]+))/g
 
 function normalizePath(value) {
-  return value.replace(/[\\/]+/g, '/').replace(/\/\.\//g, '/').replace(/\/$/, '').toLowerCase()
+  const text = String(value).replace(/[\\/]+/g, '/')
+  return /^[a-z]:\//i.test(text)
+    ? path.win32.normalize(text).replace(/[\\/]+/g, '/')
+    : path.posix.normalize(text)
 }
 
 function isAllowedTemporaryPath(value) {
-  return TEMP_PATH.test(value.replace(/\\/g, '/'))
+  return TEMP_PATH.test(normalizePath(value))
+}
+
+function isOutsideWorkspace(raw, workspacePath) {
+  const original = String(raw).replace(/^['"]|['"]$/g, '')
+  const value = original.startsWith('~/') || original.startsWith('~\\')
+    ? path.join(os.homedir(), original.slice(2))
+    : original
+  if (value.includes('\0')) return true
+  const windows = /^[a-z]:[\\/]/i.test(value) || /^[a-z]:[\\/]/i.test(workspacePath)
+  const api = windows ? path.win32 : path.posix
+  const root = api.resolve(workspacePath)
+  const target = api.resolve(root, value)
+  const relative = api.relative(root, target)
+  const compared = windows ? relative.toLowerCase() : relative
+  return compared !== '' && (compared === '..' || compared.startsWith(`..${api.sep}`) || api.isAbsolute(relative))
+}
+
+function shellTokens(value) {
+  return [...String(value).matchAll(/"([^"\\]*(?:\\.[^"\\]*)*)"|'([^']*)'|([^\s;&|]+)/g)]
+    .map(match => match[1] ?? match[2] ?? match[3])
+}
+
+function extractWriteTargets(command) {
+  const targets = []
+  for (const match of String(command).matchAll(/(?<![<])(?:[0-9]+)?(?:>>|>|>&|&>)\s*(?:"([^"\\]*(?:\\.[^"\\]*)*)"|'([^']*)'|([^\s;&|]+))/g)) {
+    targets.push(match[1] ?? match[2] ?? match[3])
+  }
+  for (const match of String(command).matchAll(/(?:^|[;&|]\s*)(?:sudo\s+)?(?:tee|touch|mkdir|install|cp|mv|ln|chmod|chown|sed\s+-[^\n]*i|perl\s+-[^\n]*i)\b([^\n;&|]*)/gi)) {
+    for (const token of shellTokens(match[1])) {
+      if (!token.startsWith('-') && (token.includes('/') || token.includes('\\') || token.startsWith('~') || token === '.' || token === '..')) targets.push(token)
+    }
+  }
+  return targets
 }
 
 /** Detect explicit writes outside cwd while allowing conventional temp paths. */
 export function findOutsideWorkspaceWrite(command, workspacePath) {
   if (typeof command !== 'string' || typeof workspacePath !== 'string' || workspacePath.length === 0) return undefined
-  const cwd = normalizePath(workspacePath)
-  const candidates = []
-  let match
-  while ((match = SHELL_REDIRECTION.exec(command)) !== null) candidates.push(match[1])
-  if (WRITE_PATH_COMMANDS.test(command)) {
-    while ((match = PATH_TOKEN.exec(command)) !== null) {
-      const value = match[1] ?? match[2]
-      if (value.includes('/') || value.includes('\\') || value.startsWith('~')) candidates.push(value)
-    }
-  }
-  for (const raw of candidates) {
-    const value = raw.replace(/^['"]|['"]$/g, '').replace(/^~(?=[\\/])/, '')
-    const normalized = normalizePath(value)
-    if (isAllowedTemporaryPath(value)) continue
-    if (normalized.startsWith('/') || /^[a-z]:\//i.test(normalized) || raw.startsWith('~')) {
-      if (!normalized.startsWith(`${cwd}/`) && normalized !== cwd) return raw
-    }
+  for (const raw of extractWriteTargets(command)) {
+    if (!isAllowedTemporaryPath(raw) && isOutsideWorkspace(raw, workspacePath)) return raw
   }
   return undefined
 }
 
 function writeScopeViolation(command, workspacePath, toolName, toolArguments) {
-  const rawTarget = toolName === 'write' || toolName === 'edit'
-    ? (() => { try { return JSON.parse(toolArguments ?? '{}')?.file_path } catch { return undefined } })()
-    : undefined
-  const text = rawTarget ?? command
-  if (typeof text !== 'string' || typeof workspacePath !== 'string' || workspacePath.length === 0) return rawTarget !== undefined ? 'unresolved-write-target' : undefined
-  if (rawTarget === undefined && !WRITE_PATH_COMMANDS.test(text)) return undefined
-  if (/\$\{|\$[A-Za-z_][A-Za-z0-9_]*|%[^%]+%/.test(text)) return 'dynamic-write-target'
-  const targets = rawTarget !== undefined ? [rawTarget] : [...text.matchAll(/(?:>|>>|tee|touch|mkdir|cp|mv|install|rsync|sed\s+-i)\s+[^\s;&|]*\s*([^\s;&|]+)/gi)].map(match => match[1]).filter(Boolean)
-  if (targets.length === 0) return rawTarget !== undefined ? 'unresolved-write-target' : undefined
-  const cwd = normalizePath(workspacePath)
-  for (const target of targets) {
-    const normalized = normalizePath(String(target).replace(/^['"]|['"]$/g, ''))
-    if (isAllowedTemporaryPath(String(target))) continue
-    if ((normalized.startsWith('/') || /^[a-z]:\//i.test(normalized) || String(target).startsWith('~'))
-      && normalized !== cwd && !normalized.startsWith(`${cwd}/`)) return target
+  const isFileMutationTool = toolName === 'write' || toolName === 'edit'
+  if (isFileMutationTool) {
+    let rawTarget
+    try {
+      const parsed = JSON.parse(toolArguments ?? '')
+      rawTarget = parsed !== null && typeof parsed === 'object' ? parsed.file_path : undefined
+    } catch {
+      return 'unresolved-write-target'
+    }
+    if (typeof rawTarget !== 'string' || rawTarget.length === 0) return 'unresolved-write-target'
+    return typeof workspacePath !== 'string' || workspacePath.length === 0 || isOutsideWorkspace(rawTarget, workspacePath)
+      ? rawTarget
+      : undefined
   }
-  return undefined
+  if (typeof command !== 'string') return undefined
+  const dynamicCandidate = DYNAMIC_WRITE_COMMANDS.test(command)
+  const writeCandidate = dynamicCandidate || WRITE_PATH_COMMANDS.test(command) || /(?<![<])(?:[0-9]+)?(?:>>|>|>&|&>)\s*/.test(command)
+  if (typeof workspacePath !== 'string' || workspacePath.length === 0) return writeCandidate ? 'unresolved-write-target' : undefined
+  if (!writeCandidate) return undefined
+  if (dynamicCandidate) return 'unresolved-write-target'
+  if (/\$\{|\$[A-Za-z_][A-Za-z0-9_]*|%[^%]+%/.test(command)) return 'dynamic-write-target'
+  const targets = extractWriteTargets(command)
+  if (targets.length === 0) return 'unresolved-write-target'
+  return findOutsideWorkspaceWrite(command, workspacePath)
 }
 
 export { DEFAULT_DANGER_PATTERNS } from './danger-patterns.js'
