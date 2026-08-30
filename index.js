@@ -1,6 +1,93 @@
 import { randomUUID } from 'node:crypto'
+import path from 'node:path'
+import os from 'node:os'
 import Schema from '@deepseek-ai/schemastery'
 import { DEFAULT_DANGER_PATTERNS } from './danger-patterns.js'
+
+const WRITE_PATH_COMMANDS = /(?:^|[;&|]\s*)(?:sudo\s+)?(?:tee|touch|mkdir|install|cp|mv|ln|chmod|chown|sed\s+-[^\n]*i|perl\s+-[^\n]*i)\b/i
+const DYNAMIC_WRITE_COMMANDS = /(?:^|[^\w])(?:sudo\s+)?(?:python(?:3)?\s+-c|node\s+-e|(?:ba|z|k)?sh\s+-c|powershell(?:\.exe)?\s+-command|pwsh\s+-command|xargs)\b/i
+const TEMP_PATH = /^(?:[a-z]:[\\/]+users[\\/]+[^\\/]+[\\/]appdata[\\/]local[\\/]temp(?:[\\/]|$)|[\\/]tmp(?:[\\/]|$)|[\\/]var[\\/]tmp(?:[\\/]|$)|%temp%(?:[\\/]|$)|\$tmpdir(?:[\\/]|$))/i
+
+function normalizePath(value) {
+  const text = String(value).replace(/[\\/]+/g, '/')
+  return /^[a-z]:\//i.test(text)
+    ? path.win32.normalize(text).replace(/[\\/]+/g, '/')
+    : path.posix.normalize(text)
+}
+
+function isAllowedTemporaryPath(value) {
+  return TEMP_PATH.test(normalizePath(value))
+}
+
+function isOutsideWorkspace(raw, workspacePath) {
+  const original = String(raw).replace(/^['"]|['"]$/g, '')
+  if (/^~[^\\/]/.test(original)) return true
+  const value = original.startsWith('~/') || original.startsWith('~\\')
+    ? path.join(os.homedir(), original.slice(2))
+    : original
+  if (value.includes('\0')) return true
+  const windows = /^[a-z]:[\\/]/i.test(value) || /^[a-z]:[\\/]/i.test(workspacePath)
+  const api = windows ? path.win32 : path.posix
+  const root = api.resolve(workspacePath)
+  const target = api.resolve(root, value)
+  const relative = api.relative(root, target)
+  const compared = windows ? relative.toLowerCase() : relative
+  return compared !== '' && (compared === '..' || compared.startsWith(`..${api.sep}`) || api.isAbsolute(relative))
+}
+
+function shellTokens(value) {
+  return [...String(value).matchAll(/"([^"\\]*(?:\\.[^"\\]*)*)"|'([^']*)'|([^\s;&|]+)/g)]
+    .map(match => match[1] ?? match[2] ?? match[3])
+}
+
+function extractWriteTargets(command) {
+  const targets = []
+  for (const match of String(command).matchAll(/(?<![<])(?:[0-9]+)?(?:>>|>|>&|&>)\s*(?:"([^"\\]*(?:\\.[^"\\]*)*)"|'([^']*)'|([^\s;&|]+))/g)) {
+    targets.push(match[1] ?? match[2] ?? match[3])
+  }
+  for (const match of String(command).matchAll(/(?:^|[;&|]\s*)(?:sudo\s+)?(?:tee|touch|mkdir|install|cp|mv|ln|chmod|chown|sed\s+-[^\n]*i|perl\s+-[^\n]*i)\b([^\n;&|]*)/gi)) {
+    for (const token of shellTokens(match[1])) {
+      if (!token.startsWith('-') && (token.includes('/') || token.includes('\\') || token.startsWith('~') || token === '.' || token === '..')) targets.push(token)
+    }
+  }
+  return targets
+}
+
+/** Detect explicit writes outside cwd while allowing conventional temp paths. */
+export function findOutsideWorkspaceWrite(command, workspacePath) {
+  if (typeof command !== 'string' || typeof workspacePath !== 'string' || workspacePath.length === 0) return undefined
+  for (const raw of extractWriteTargets(command)) {
+    if (!isAllowedTemporaryPath(raw) && isOutsideWorkspace(raw, workspacePath)) return raw
+  }
+  return undefined
+}
+
+function writeScopeViolation(command, workspacePath, toolName, toolArguments) {
+  const isFileMutationTool = toolName === 'write' || toolName === 'edit'
+  if (isFileMutationTool) {
+    let rawTarget
+    try {
+      const parsed = JSON.parse(toolArguments ?? '')
+      rawTarget = parsed !== null && typeof parsed === 'object' ? parsed.file_path : undefined
+    } catch {
+      return 'unresolved-write-target'
+    }
+    if (typeof rawTarget !== 'string' || rawTarget.length === 0) return 'unresolved-write-target'
+    return typeof workspacePath !== 'string' || workspacePath.length === 0 || isOutsideWorkspace(rawTarget, workspacePath)
+      ? rawTarget
+      : undefined
+  }
+  if (typeof command !== 'string') return undefined
+  const dynamicCandidate = DYNAMIC_WRITE_COMMANDS.test(command)
+  const writeCandidate = dynamicCandidate || WRITE_PATH_COMMANDS.test(command) || /(?<![<])(?:[0-9]+)?(?:>>|>|>&|&>)\s*/.test(command)
+  if (typeof workspacePath !== 'string' || workspacePath.length === 0) return writeCandidate ? 'unresolved-write-target' : undefined
+  if (!writeCandidate) return undefined
+  if (dynamicCandidate) return 'unresolved-write-target'
+  if (/\$\{|\$[A-Za-z_][A-Za-z0-9_]*|%[^%]+%/.test(command)) return 'dynamic-write-target'
+  const targets = extractWriteTargets(command)
+  if (targets.length === 0) return 'unresolved-write-target'
+  return findOutsideWorkspaceWrite(command, workspacePath)
+}
 
 export { DEFAULT_DANGER_PATTERNS } from './danger-patterns.js'
 
@@ -21,8 +108,8 @@ const CLASSIFIER_SYSTEM_PROMPT = [
   'Ask for publishing or releasing to a shared or public destination: package registries, production deploys, shared or production-like branches, and anything other people immediately consume.',
   'Ask for system-wide privileged changes: sudo, writes under /etc, /usr, /Library, or /System, system daemons and launch agents, global package managers, firewall or security settings, and changes to other user accounts.',
   'Ask when the command is genuinely unreadable to you — obfuscated, encoded, or fetched-then-executed from an unknown source — so you cannot tell what it does at all.',
-  'Everything else is routine developer work: approve it. Writing inside the user\'s own tool and configuration directories (for example ~/.dsh, ~/.config, ~/.cache, and per-application support directories), installing or updating dependencies, running builds, tests, linters, and formatters, starting or restarting the user\'s own local services, reading files and fetching read-only resources, and inspecting local processes and ports are all approve.',
-  'The requested sandbox mode alone is not a reason to ask; judge the concrete operation, justification, and workspace scope. Work outside the session workspace is normal and is not by itself a reason to ask.',
+  'Everything else is routine developer work: installing or updating dependencies, running builds, tests, linters, and formatters, starting or restarting the user\'s own local services, reading files and fetching read-only resources, and inspecting local processes and ports are all approve.',
+  'The requested sandbox mode alone is not a reason to ask; judge the concrete operation, justification, and workspace scope. Writes outside the session workspace are handled by the deterministic scope check before classification; if the target cannot be resolved, ask.',
   'Treat latestUserMessage as trusted context written directly by the user. When it explicitly authorizes the concrete operation under review (for example, pushing to the user\'s own fork), approve even if a concern above would otherwise apply, except for credential exfiltration, which always asks. Command examples or quoted commands alone are not execution authorization.',
   'For ordinary git push requests, pushing to the user\'s own fork or working branch is routine; pushing to main, master, release, production, prod, or another shared/production-like branch should be ask. Force-pushes are handled before classification by the danger list.',
 ].join('\n')
@@ -477,6 +564,13 @@ export function createApprovalHandler(ctx, config, patterns, lifecycle = {}) {
       if (danger !== undefined) {
         record('danger', `pattern=${danger.source}`)
         logDecision(ctx, 'manual', `pattern=${JSON.stringify(danger.source)}`)
+        return delegate()
+      }
+
+      const outsideWrite = writeScopeViolation(command, session.header?.cwd, req.toolName, toolArguments)
+      if (outsideWrite !== undefined) {
+        record('danger', `outside-workspace-write=${inlineSummary(outsideWrite, COMMAND_SUMMARY_MAX_CHARS)}`)
+        logDecision(ctx, 'manual', `outside-workspace-write=${JSON.stringify(outsideWrite)}`)
         return delegate()
       }
 

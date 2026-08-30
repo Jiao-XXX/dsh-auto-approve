@@ -211,6 +211,10 @@ Duplicate rules are deduplicated; an invalid regular expression reports an error
 
 This plugin reduces approval prompts; it does not prove that a command is safe. The command, justification, and other approval fields are untrusted model input. Only the newest genuine message with `source.kind === "user"` is trusted task context, and command examples or quotations inside it still do not constitute execution authorization. The default `classifierPrompt` states that boundary, and strict output parsing fails closed. If you replace the complete prompt, preserve equivalent strict-JSON and data-isolation constraints. Prompt injection and classifier mistakes remain possible. The deterministic list is intentionally evaluated first, yet no finite regular-expression list covers every destructive spelling or indirect effect.
 
+### Workspace scope and command-line writes
+
+In `auto` mode, in-workspace `edit`/`write` targets retain automatic approval; outside or unresolvable targets go to human review before classification. The plugin also conservatively checks explicit output redirections and common write commands. Complex dynamic commands fall back to human review. This is not a complete shell parser and does not currently guarantee protection against symlink or junction escapes.
+
 ### What one automatic grant actually gives
 
 A dsh sandbox escalation has no path granularity: the only target a model can request is `danger-full-access`. Every automatic grant therefore means **that one command runs unconfined by the workspace sandbox**, not that the single directory it mentioned was opened. The grant is one-shot (`allowed-once`) and does not carry to the next command, but for the duration of that command there is no workspace confinement.
