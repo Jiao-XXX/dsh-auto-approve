@@ -560,8 +560,10 @@ test('classifierPrompt rejects an empty string at plugin load', () => {
 
 test('null provider and model follow the current default model on every classification', async () => {
   let selection = { provider: 'openai-compatible', model: 'general-model' }
+  // Memory is off so the identical second request is classified again; this
+  // test is about default-model resolution, not about replaying a grant.
   const app = harness({
-    config: { provider: null, model: null },
+    config: { provider: null, model: null, sessionMemory: false },
     defaultModelSelection: () => selection,
   })
 
@@ -1121,4 +1123,81 @@ test('invalid regular expressions fail loudly at plugin load', () => {
     () => apply(ctx, { extraDangerPatterns: ['['] }),
     /dsh-auto-approve: invalid danger pattern/,
   )
+})
+
+test('session memory replays a classifier approval without calling the LLM again', async () => {
+  const app = harness()
+  assert.deepEqual(await app.run(), { result: 'allowed-once', nextCalls: 0 })
+  assert.equal(app.llmCalls, 1)
+  assert.deepEqual(await app.run(), { result: 'allowed-once', nextCalls: 0 })
+  assert.equal(app.llmCalls, 1)
+  assert.ok(app.logs.some(line => /verdict=remembered source=classifier/.test(line)))
+  const report = await app.runCommand()
+  assert.match(report.text, /remembered source=classifier/)
+})
+
+test('session memory replays a human grant for the identical call', async () => {
+  const app = harness({ stream: () => textResponse('{"verdict":"ask"}') })
+  assert.deepEqual(await app.run(requestOf(), () => 'allowed-once'), { result: 'allowed-once', nextCalls: 1 })
+  assert.equal(app.llmCalls, 1)
+  assert.deepEqual(await app.run(), { result: 'allowed-once', nextCalls: 0 })
+  assert.equal(app.llmCalls, 1)
+  assert.ok(app.logs.some(line => /verdict=remembered source=human/.test(line)))
+})
+
+test('a human rejection is never remembered', async () => {
+  const app = harness({ stream: () => textResponse('{"verdict":"ask"}') })
+  assert.deepEqual(await app.run(requestOf(), () => 'rejected'), { result: 'rejected', nextCalls: 1 })
+  assert.deepEqual(await app.run(requestOf(), () => 'rejected'), { result: 'rejected', nextCalls: 1 })
+  assert.equal(app.llmCalls, 2)
+})
+
+test('session memory never replays a danger-list match', async () => {
+  const app = harness({ stream: () => textResponse('{"verdict":"ask"}') })
+  const dangerous = requestOf({ command: 'git push --force origin main' })
+  assert.deepEqual(await app.run(dangerous, () => 'allowed-once'), { result: 'allowed-once', nextCalls: 1 })
+  assert.deepEqual(await app.run(dangerous, () => MANUAL), { result: MANUAL, nextCalls: 1 })
+  assert.equal(app.llmCalls, 0)
+})
+
+test('session memory is keyed on the exact arguments and isolated per session', async () => {
+  const app = harness()
+  await app.run()
+  assert.equal(app.llmCalls, 1)
+  await app.run(requestOf({ command: 'npm install left-pad ' }))
+  assert.equal(app.llmCalls, 2)
+  await app.run(requestOf({ sessionId: 'session-2' }))
+  assert.equal(app.llmCalls, 3)
+})
+
+test('session memory expires after sessionMemoryTtlMs', async () => {
+  const app = harness({ config: { sessionMemoryTtlMs: 1 } })
+  await app.run()
+  assert.equal(app.llmCalls, 1)
+  await new Promise(resolve => setTimeout(resolve, 5))
+  await app.run()
+  assert.equal(app.llmCalls, 2)
+})
+
+test('session memory can be disabled and is cleared on unload', async () => {
+  const disabled = harness({ config: { sessionMemory: false } })
+  await disabled.run()
+  await disabled.run()
+  assert.equal(disabled.llmCalls, 2)
+
+  // After unload the lifetime signal is aborted before memory is consulted,
+  // so a previously remembered grant must delegate instead of replaying.
+  const app = harness()
+  assert.deepEqual(await app.run(), { result: 'allowed-once', nextCalls: 0 })
+  await app.dispose()
+  assert.deepEqual(await app.run(), { result: MANUAL, nextCalls: 1 })
+  assert.equal(app.llmCalls, 1)
+})
+
+test('a missing tool call leaves memory untouched', async () => {
+  const app = harness()
+  const noCall = requestOf({ events: [] })
+  assert.deepEqual(await app.run(noCall), { result: 'allowed-once', nextCalls: 0 })
+  assert.deepEqual(await app.run(noCall), { result: 'allowed-once', nextCalls: 0 })
+  assert.equal(app.llmCalls, 2)
 })

@@ -23,6 +23,8 @@
 
 `auto` 是 `workspace-write` 之上的低打扰安全层：保留同一沙箱边界，把例行升级交给分类器；命中危险清单、分类器拿不准或分类失败时，才回到人工审批。
 
+与关闭沙箱、自建审批通道的同类方案不同，本插件**不放宽任何沙箱边界**：分类器只决定是否放行**一次**升级，文件工具与其他非 shell 操作仍然受沙箱约束，审批记录也仍然落在 dsh 原生的会话审计事件里。
+
 直观地说，它类似 [Claude Code 的 **auto mode**](https://code.claude.com/docs/en/permission-modes) 与 [Codex 的 **Auto-review mode**](https://developers.openai.com/codex/agent-approvals-security)：把例行审批交给安全评审，危险或拿不准时再交还人工。
 
 | 权限档 | 沙箱范围 | 什么时候弹窗 | 适合场景 |
@@ -38,8 +40,9 @@
 
 1. 从内存中的会话日志找回对应 `tool/call` 的原始参数，并读取最新一条真人用户消息：只接受 `user/message` 中 `source.kind === "user"` 的文本，忽略插件消息。消息不超过 2000 个字符时完整加入证据；超过上限则不截断猜测，直接转人工。
 2. 先用确定性危险清单检查 justification 和工具参数；混淆熔断会把带命令替换或进程替换的破坏性命令直接交给人工。
-3. 把命令、justification、目标沙箱模式、工作区路径和 `latestUserMessage` 交给配置的分类模型。真人消息里的明确授权可帮助判定具体操作，但命令示例和引用本身不算执行授权。
-4. 只有模型严格返回 `{"verdict":"approve"}` 时才返回 `allowed-once`；其他情况全部交给下一位应答者：Web UI、TUI 审批面板或 Desktop 内嵌 UI。
+3. 查会话内命令记忆：同一会话中、完全相同的工具调用（工具名 + 原始参数）若已被分类器放行或已被你人工批准过，且未超过 `sessionMemoryTtlMs`，直接放行并记为 `remembered`。命中危险清单的调用永远不会进入记忆。
+4. 把命令、justification、目标沙箱模式、工作区路径和 `latestUserMessage` 交给配置的分类模型。真人消息里的明确授权可帮助判定具体操作，但命令示例和引用本身不算执行授权。
+5. 只有模型严格返回 `{"verdict":"approve"}` 时才返回 `allowed-once`；其他情况全部交给下一位应答者：Web UI、TUI 审批面板或 Desktop 内嵌 UI。
 
 内置危险清单覆盖破坏性 `rm -rf` 目标、设备写入与格式化、强制推送、下载后直接送入 shell、破坏性 SQL、主机关机、对根路径递归 `chmod 777`、shell fork 炸弹、Terraform/Pulumi 销毁，以及把 `rm`、`dd`、`mkfs`、`chmod` 或 `chown` 与 `$()`、反引号或 `<()` 组合的混淆写法。LLM 无法推翻已经命中的危险规则。
 
@@ -92,6 +95,8 @@ dsh plugin --profile web remove dsh-auto-approve
 | `timeoutMs` | `15000` | 分类调用的端到端超时，单位毫秒。 |
 | `extraDangerPatterns` | `[]` | 追加到内置清单的大小写不敏感正则。 |
 | `dangerPatterns` | `null` | `null` 保留内置清单；数组会整体替换内置清单。 |
+| `sessionMemory` | `true` | 会话内命令记忆：同一会话里完全相同的工具调用，被分类器放行或被你人工批准后，再次出现时直接放行。 |
+| `sessionMemoryTtlMs` | `1800000` | 记忆条目的有效期（默认 30 分钟），过期后重新分类。 |
 
 `provider` 与 `model` 会在每次分类时独立解析，因此有三种常见用法：
 
@@ -171,6 +176,8 @@ dsh plugin --profile web remove dsh-auto-approve
     extraDangerPatterns:
       - '\bkubectl\s+delete\b'
     dangerPatterns: null
+    sessionMemory: true
+    sessionMemoryTtlMs: 1800000
 ```
 
 无效正则会在插件加载时立即报错，不会被静默忽略。
@@ -207,6 +214,10 @@ npm run tune -- \
 重复规则会去重，无效正则会报错并以非零状态退出。未提供自定义规则时，critique 会原样显示“`未提供自定义规则，仅执行日志统计`”。导出的 rc.6 审批事件不能识别 `allowed-once` 的批准者，因此脚本不会把它擅自标成自动或人工；所有规则或调优建议都只是待人工审阅和真机验证的候选，不能直接当作安全结论。
 
 ## 安全说明
+
+### 会话内命令记忆的边界
+
+记忆的键是**工具名 + 原始参数的完整哈希**，只有逐字节完全相同的调用才命中；同类但不同的命令仍会重新分类。记忆只存在于进程内存、按会话隔离、默认 30 分钟过期，重启或卸载插件即清空。命中确定性危险清单的调用在进入记忆之前就已转人工，因此**永远不会被记忆回放**。被记忆回放的放行仍会产生 dsh 原生的 `approval/asked` + `approval/decided` 审计对，并在 `/auto-report` 中标记为 `remembered`（来源为 `classifier` 或 `human`）。不需要这一行为时设 `sessionMemory: false`。
 
 本插件减少的是审批弹窗，并不能证明一条命令绝对安全。命令、justification 和其他审批字段都是不可信的模型输入；只有最新一条 `source.kind === "user"` 的真人消息被作为可信任务上下文，而且其中的命令示例或引用仍不等于执行授权。默认 `classifierPrompt` 会明确这条边界，严格输出解析也会安全回退；如果完整替换该提示，请自行保留同等的严格 JSON 与数据隔离约束。提示注入与分类错误仍然存在。确定性清单始终优先执行，不过有限的正则无法覆盖所有破坏性写法和间接副作用。
 
@@ -285,6 +296,8 @@ DeepSeek Harness rc.6 的 Permissions 选择器尚未提供自定义预设图标
     timeoutMs: 15000
     extraDangerPatterns: []
     dangerPatterns: null
+    sessionMemory: true
+    sessionMemoryTtlMs: 1800000
 ```
 
 **为什么普通 push 仍然弹窗？**

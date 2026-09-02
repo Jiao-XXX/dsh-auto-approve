@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import Schema from '@deepseek-ai/schemastery'
 import { DEFAULT_DANGER_PATTERNS } from './danger-patterns.js'
 
@@ -52,7 +52,41 @@ export const Config = Schema.object({
     Schema.array(Schema.string()),
     Schema.const(null),
   ]).default(null),
+  sessionMemory: Schema.boolean().default(true),
+  sessionMemoryTtlMs: Schema.number().step(1).min(1).max(2_147_483_647).default(1_800_000),
 })
+
+const SESSION_MEMORY_MAX_ENTRIES = 200
+
+/** Key for "the same escalation again": the tool name plus its raw arguments. */
+function commandMemoryKey(toolName, toolArguments) {
+  return createHash('sha256').update(`${toolName ?? ''}\n${toolArguments ?? ''}`).digest('hex')
+}
+
+/** Read a remembered grant for this session, dropping it when it has expired. */
+function rememberedApproval(memoryBySession, sessionId, key, ttlMs, now) {
+  const entries = memoryBySession.get(sessionId)
+  const entry = entries?.get(key)
+  if (entry === undefined) return undefined
+  if (now - entry.at > ttlMs) {
+    entries.delete(key)
+    return undefined
+  }
+  return entry
+}
+
+/** Remember one grant for this session; bounded so a long session cannot grow without limit. */
+function rememberApproval(memoryBySession, sessionId, key, source, now) {
+  let entries = memoryBySession.get(sessionId)
+  if (entries === undefined) {
+    entries = new Map()
+    memoryBySession.set(sessionId, entries)
+  }
+  if (!entries.has(key) && entries.size >= SESSION_MEMORY_MAX_ENTRIES) {
+    entries.delete(entries.keys().next().value)
+  }
+  entries.set(key, Object.freeze({ source, at: now }))
+}
 
 function classifierModelSelection(ctx, config) {
   // Schemastery treats both an omitted nullable key and an explicit null as
@@ -438,6 +472,7 @@ export function createApprovalHandler(ctx, config, patterns, lifecycle = {}) {
   const lifetimeSignal = lifecycle.signal
   const recordDecision = lifecycle.recordDecision
   const trackIteratorCleanup = lifecycle.trackIteratorCleanup
+  const memory = lifecycle.memory
   return async (req, next) => {
     let command
     let reportCommand
@@ -487,6 +522,20 @@ export function createApprovalHandler(ctx, config, patterns, lifecycle = {}) {
         return delegate()
       }
 
+      // Session memory is consulted only after the danger list: a danger match
+      // never reaches this point, so it can never be replayed from memory.
+      const memoryKey = config.sessionMemory && memory !== undefined && toolArguments !== undefined
+        ? commandMemoryKey(req.toolName, toolArguments)
+        : undefined
+      if (memoryKey !== undefined) {
+        const remembered = memory.lookup(session.id, memoryKey)
+        if (remembered !== undefined) {
+          logDecision(ctx, 'auto-approve', `verdict=remembered source=${remembered.source}`)
+          record('auto-approved', `verdict=remembered source=${remembered.source}`)
+          return 'allowed-once'
+        }
+      }
+
       const userMessage = latestUserMessage(events)
       if (userMessage.tooLong) {
         record('classifier-manual', 'verdict=latest-user-message-too-long')
@@ -518,11 +567,18 @@ export function createApprovalHandler(ctx, config, patterns, lifecycle = {}) {
           return delegate()
         }
         record('auto-approved', 'verdict=approve')
+        if (memoryKey !== undefined) memory.remember(session.id, memoryKey, 'classifier')
         return 'allowed-once'
       }
       record('classifier-manual', `verdict=${decision.detail}`)
       logDecision(ctx, 'manual', `verdict=${decision.detail}`)
-      return delegate()
+      // The human answers this one; if they grant it, the identical request
+      // later in the same session is granted without asking again.
+      const outcome = await delegate()
+      if (outcome === 'allowed-once' && memoryKey !== undefined) {
+        memory.remember(session.id, memoryKey, 'human')
+      }
+      return outcome
     } catch (error) {
       if (delegated) throw error
       if (!categorized && autoPreset) record('classifier-manual', 'verdict=internal-error')
@@ -542,6 +598,23 @@ export function apply(ctx, config = {}) {
   const resolved = Config(config)
   const patterns = compileDangerPatterns(resolved)
   const reportBySession = new Map()
+  const memoryBySession = new Map()
+  const memory = Object.freeze({
+    lookup(sessionId, key) {
+      try {
+        return rememberedApproval(memoryBySession, sessionId, key, resolved.sessionMemoryTtlMs, Date.now())
+      } catch {
+        return undefined
+      }
+    },
+    remember(sessionId, key, source) {
+      try {
+        rememberApproval(memoryBySession, sessionId, key, source, Date.now())
+      } catch {
+        // Memory is a convenience; a bookkeeping failure never changes an outcome.
+      }
+    },
+  })
   ctx.effect(() => {
     const lifetime = new AbortController()
     const activeClassifications = new Set()
@@ -567,6 +640,7 @@ export function apply(ctx, config = {}) {
         trackClassification,
         trackIteratorCleanup,
         recordDecision: row => { appendReportRow(reportBySession, row) },
+        memory,
       }),
       { prepend: true },
     )
@@ -580,6 +654,7 @@ export function apply(ctx, config = {}) {
       await Promise.allSettled([...activeClassifications])
       await Promise.allSettled([...activeIteratorCleanups])
       reportBySession.clear()
+      memoryBySession.clear()
     }
   }, 'dsh-auto-approve: abort and drain active classifications')
 

@@ -22,6 +22,8 @@
         timeoutMs: 15000
         extraDangerPatterns: []
         dangerPatterns: null
+        sessionMemory: true
+        sessionMemoryTtlMs: 1800000
 
 - id: permission
   config:

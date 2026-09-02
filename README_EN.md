@@ -24,6 +24,8 @@ The bundle restates the permission preset table as four entries, in this order: 
 
 `auto` is a lower-friction safety layer on top of `workspace-write`: it keeps the same sandbox boundary and sends routine escalations to the classifier, while danger-list matches, classifier uncertainty, and classification failures return to human approval.
 
+Unlike comparable schemes that switch the sandbox off and run their own approval channel, this plugin **relaxes no sandbox boundary**: the classifier only decides whether to grant **one** escalation, file tools and other non-shell operations stay sandboxed, and approvals still land in dsh's native session audit events.
+
 Think of it as DeepSeek Harness's counterpart to [Claude Code's **auto mode**](https://code.claude.com/docs/en/permission-modes) and [Codex's **Auto-review mode**](https://developers.openai.com/codex/agent-approvals-security): routine approvals are handled automatically, while dangerous or uncertain actions go back to a human.
 
 | Preset | Sandbox scope | When it prompts | Best for |
@@ -39,8 +41,9 @@ For each `approval/request` in the `auto` preset, the plugin:
 
 1. Recovers the raw `tool/call` arguments from the in-memory session log and reads the newest genuine user message: only text from a `user/message` whose `source.kind === "user"` is accepted, and plugin messages are ignored. Messages up to 2,000 characters are included in full; a longer message is not truncated and guessed from, but sent directly to human review.
 2. Checks the justification and tool arguments against a deterministic danger list; a confusion circuit breaker sends destructive commands that use command or process substitution directly to a human.
-3. Sends the command, justification, target sandbox mode, workspace path, and `latestUserMessage` to the configured classifier model. Explicit authorization in the genuine user message can inform the concrete decision, but command examples or quotations alone are not execution authorization.
-4. Returns `allowed-once` only for the exact response `{"verdict":"approve"}`. Every other result delegates to the next responder: the Web UI, the TUI approval panel, or an embedded Desktop UI.
+3. Consults session memory: an identical tool call (tool name plus raw arguments) in the same session that the classifier already approved, or that you already approved by hand, is granted directly and recorded as `remembered` while it is within `sessionMemoryTtlMs`. A call that matches the danger list never enters memory.
+4. Sends the command, justification, target sandbox mode, workspace path, and `latestUserMessage` to the configured classifier model. Explicit authorization in the genuine user message can inform the concrete decision, but command examples or quotations alone are not execution authorization.
+5. Returns `allowed-once` only for the exact response `{"verdict":"approve"}`. Every other result delegates to the next responder: the Web UI, the TUI approval panel, or an embedded Desktop UI.
 
 The built-in danger list covers destructive `rm -rf` targets, device writes and formatting, force-pushes, download-to-shell pipelines, destructive SQL, host shutdown, root-wide `chmod 777`, the shell fork bomb, Terraform/Pulumi destruction, and obfuscated combinations of `rm`, `dd`, `mkfs`, `chmod`, or `chown` with `$()`, backticks, or `<()`. A model verdict can never override a danger-list match.
 
@@ -93,6 +96,8 @@ dsh plugin --profile web remove dsh-auto-approve
 | `timeoutMs` | `15000` | End-to-end classification deadline in milliseconds. |
 | `extraDangerPatterns` | `[]` | Case-insensitive regular expressions appended to the built-in list. |
 | `dangerPatterns` | `null` | `null` keeps the built-in list; an array replaces it completely. |
+| `sessionMemory` | `true` | Session memory: an identical tool call in the same session that the classifier approved, or that you approved by hand, is granted directly when it appears again. |
+| `sessionMemoryTtlMs` | `1800000` | Lifetime of a memory entry (30 minutes by default); after that the call is classified again. |
 
 `provider` and `model` are resolved independently for every classification, which supports three common setups:
 
@@ -172,6 +177,8 @@ To override the plugin row in a profile patch, restate every field because dsh p
     extraDangerPatterns:
       - '\bkubectl\s+delete\b'
     dangerPatterns: null
+    sessionMemory: true
+    sessionMemoryTtlMs: 1800000
 ```
 
 Invalid regular expressions fail immediately while the plugin loads.
@@ -208,6 +215,10 @@ npm run tune -- \
 Duplicate rules are deduplicated; an invalid regular expression reports an error and exits non-zero. With no custom rules, the critique includes the exact message `未提供自定义规则，仅执行日志统计` (“No custom rules supplied; log statistics only”). Exported rc.6 approval events cannot identify the approver behind `allowed-once`, so the script does not invent an automatic or human source. Every rule or tuning suggestion is only a candidate for human review and live validation, never a safety conclusion.
 
 ## Security considerations
+
+### Limits of session memory
+
+The memory key is a full hash of **the tool name plus the raw arguments**, so only a byte-for-byte identical call matches; a similar but different command is classified again. Memory lives only in process memory, is isolated per session, expires after 30 minutes by default, and is cleared when the plugin unloads or dsh restarts. A call that matches the deterministic danger list is sent to a human before memory is consulted, so it **can never be replayed from memory**. A grant replayed from memory still produces dsh's native `approval/asked` + `approval/decided` audit pair and is marked `remembered` in `/auto-report` (with source `classifier` or `human`). Set `sessionMemory: false` to disable the behaviour.
 
 This plugin reduces approval prompts; it does not prove that a command is safe. The command, justification, and other approval fields are untrusted model input. Only the newest genuine message with `source.kind === "user"` is trusted task context, and command examples or quotations inside it still do not constitute execution authorization. The default `classifierPrompt` states that boundary, and strict output parsing fails closed. If you replace the complete prompt, preserve equivalent strict-JSON and data-isolation constraints. Prompt injection and classifier mistakes remain possible. The deterministic list is intentionally evaluated first, yet no finite regular-expression list covers every destructive spelling or indirect effect.
 
@@ -286,6 +297,8 @@ The classifier follows the default model from Settings → Models, so changing t
     timeoutMs: 15000
     extraDangerPatterns: []
     dangerPatterns: null
+    sessionMemory: true
+    sessionMemoryTtlMs: 1800000
 ```
 
 **Why does an ordinary push still prompt?**
