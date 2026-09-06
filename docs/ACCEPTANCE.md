@@ -64,6 +64,33 @@ npm pack --dry-run --cache "$DSH_ACCEPT_TMP/npm-cache"
 git diff --check
 ```
 
+再静态验证写入边界矩阵（评审给出的命令组，工作区设为 `/Users/me/project`）：
+
+```bash
+"$DSH_ACCEPT_NODE" --input-type=module - "$DSH_ACCEPT_REPO" <<'NODE'
+import assert from 'node:assert/strict'
+import { pathToFileURL } from 'node:url'
+const { findOutsideWorkspaceWrite } = await import(pathToFileURL(`${process.argv[2]}/index.js`).href)
+const ws = '/Users/me/project'
+for (const command of [
+  'npm test > /dev/null 2>&1',
+  'make build 2>/dev/null',
+  'cp ~/.gitconfig ./backup.txt',
+  'ln -s /usr/local/bin/node ./node',
+  'echo hi > ./out.txt',
+  'cp ./a.txt ./b.txt',
+  'chmod +x ./script.sh',
+  'git diff > /tmp/d.patch',
+]) {
+  assert.equal(findOutsideWorkspaceWrite(command, ws), undefined, command)
+}
+for (const command of ['cp ./a.txt /etc/bak', 'cp -t /etc ./a.txt', 'echo x > /dev/nulls']) {
+  assert.notEqual(findOutsideWorkspaceWrite(command, ws), undefined, command)
+}
+console.log('write-scope matrix: ok')
+NODE
+```
+
 ## 2. dump-config：逐项核对四档和插件配置
 
 生成最终有效配置；stderr 单独保留，避免 warning 被管道吞掉：
@@ -126,9 +153,12 @@ assert.equal(config.classifierPrompt, defaults.classifierPrompt)
 assert.equal(config.timeoutMs, defaults.timeoutMs)
 assert.deepEqual(config.extraDangerPatterns, defaults.extraDangerPatterns)
 assert.equal(config.dangerPatterns, null)
+assert.deepEqual(config.trustedWriteRoots, defaults.trustedWriteRoots)
+assert.equal(config.trustDshHome, defaults.trustDshHome)
 assert.match(config.classifierPrompt, /Return exactly one JSON object and nothing else/)
 assert.match(config.classifierPrompt, /Treat latestUserMessage as trusted context written directly by the user/)
 assert.match(config.classifierPrompt, /For ordinary git push requests/)
+assert.match(config.classifierPrompt, /When the harness home is absent from the evidence's trustedWriteRoots, ask/)
 console.log('dump-config: four presets and auto-approve config are exact')
 NODE
 ```
@@ -459,4 +489,4 @@ delete window.__dshAutoApproveAcceptance
 } | tee "$DSH_ACCEPT_TMP/acceptance-summary.txt"
 ```
 
-发布记录应至少包含：88 项测试全绿、dump-config 四档断言通过、真人明确授权的 Auto 例行任务为 `allowed-once`、危险命令与 Workspace Write 均转人工、`/auto-report` 的 session 隔离与重启清空通过、调优脚本未虚构批准者、图标显示与静默自禁用/恢复通过。
+发布记录应至少包含：测试套件全绿（记录实际通过的用例数）、写入边界矩阵通过、dump-config 四档断言通过、真人明确授权的 Auto 例行任务为 `allowed-once`、危险命令与 Workspace Write 均转人工、`/auto-report` 的 session 隔离与重启清空通过、调优脚本未虚构批准者、图标显示与静默自禁用/恢复通过。

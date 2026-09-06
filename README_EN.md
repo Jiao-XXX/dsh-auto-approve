@@ -39,7 +39,7 @@ For each `approval/request` in the `auto` preset, the plugin:
 
 1. Recovers the raw `tool/call` arguments from the in-memory session log and reads the newest genuine user message: only text from a `user/message` whose `source.kind === "user"` is accepted, and plugin messages are ignored. Messages up to 2,000 characters are included in full; a longer message is not truncated and guessed from, but sent directly to human review.
 2. Checks the justification and tool arguments against a deterministic danger list; a confusion circuit breaker sends destructive commands that use command or process substitution directly to a human.
-3. Sends the command, justification, target sandbox mode, workspace path, and `latestUserMessage` to the configured classifier model. Explicit authorization in the genuine user message can inform the concrete decision, but command examples or quotations alone are not execution authorization.
+3. Sends the command, justification, target sandbox mode, workspace path, the effective editable-directory list, and `latestUserMessage` to the configured classifier model. Explicit authorization in the genuine user message can inform the concrete decision, but command examples or quotations alone are not execution authorization.
 4. Returns `allowed-once` only for the exact response `{"verdict":"approve"}`. Every other result delegates to the next responder: the Web UI, the TUI approval panel, or an embedded Desktop UI.
 
 The built-in danger list covers destructive `rm -rf` targets, device writes and formatting, force-pushes, download-to-shell pipelines, destructive SQL, host shutdown, root-wide `chmod 777`, the shell fork bomb, Terraform/Pulumi destruction, and obfuscated combinations of `rm`, `dd`, `mkfs`, `chmod`, or `chown` with `$()`, backticks, or `<()`. A model verdict can never override a danger-list match.
@@ -93,6 +93,10 @@ dsh plugin --profile web remove dsh-auto-approve
 | `timeoutMs` | `15000` | End-to-end classification deadline in milliseconds. |
 | `extraDangerPatterns` | `[]` | Case-insensitive regular expressions appended to the built-in list. |
 | `dangerPatterns` | `null` | `null` keeps the built-in list; an array replaces it completely. |
+| `trustedWriteRoots` | `[]` | Custom editable directories, one absolute path per line; writes inside them (subdirectories included) no longer go to human review. Invalid entries (empty, relative, `~`) fail at plugin load. |
+| `trustDshHome` | `true` | Whether the dsh home (`$DSH_HOME`, default `~/.dsh`) also counts as editable. Set `false` to send every write to dsh's own files to human review, closing the agent-modifies-its-own-runtime persistence path. |
+
+Writes to the following locations skip the human prompt: the session workspace, device sinks such as `/dev/null` and `NUL`, system temporary directories (`/tmp`, `os.tmpdir()`, ...), the custom editable directories configured in `trustedWriteRoots`, and (when `trustDshHome` is on) the dsh home itself. The workspace and temporary directories are always allowed and cannot be removed through configuration.
 
 `provider` and `model` are resolved independently for every classification, which supports three common setups:
 
@@ -164,14 +168,17 @@ To override the plugin row in a profile patch, restate every field because dsh p
       Ask for publishing or releasing to a shared or public destination: package registries, production deploys, shared or production-like branches, and anything other people immediately consume.
       Ask for system-wide privileged changes: sudo, writes under /etc, /usr, /Library, or /System, system daemons and launch agents, global package managers, firewall or security settings, and changes to other user accounts.
       Ask when the command is genuinely unreadable to you — obfuscated, encoded, or fetched-then-executed from an unknown source — so you cannot tell what it does at all.
-      Everything else is routine developer work: approve it. Writing inside the user's own tool and configuration directories (for example ~/.dsh, ~/.config, ~/.cache, and per-application support directories), installing or updating dependencies, running builds, tests, linters, and formatters, starting or restarting the user's own local services, reading files and fetching read-only resources, and inspecting local processes and ports are all approve.
-      The requested sandbox mode alone is not a reason to ask; judge the concrete operation, justification, and workspace scope. Work outside the session workspace is normal and is not by itself a reason to ask.
+      Everything else is routine developer work: writing inside the user's own tool and configuration directories (for example ~/.dsh, ~/.config, ~/.cache, and per-application support directories), installing or updating dependencies, running builds, tests, linters, and formatters, starting or restarting the user's own local services, reading files and fetching read-only resources, and inspecting local processes and ports are all approve.
+      When the harness home is absent from the evidence's trustedWriteRoots, ask for operations that modify the agent harness's own runtime: installing or removing its plugins, or changing its presets or profile configuration.
+      The requested sandbox mode alone is not a reason to ask; judge the concrete operation, justification, and workspace scope. Writes outside the session workspace and the evidence's trustedWriteRoots are handled by the deterministic scope check before classification; if the target cannot be resolved, ask.
       Treat latestUserMessage as trusted context written directly by the user. When it explicitly authorizes the concrete operation under review (for example, pushing to the user's own fork), approve even if a concern above would otherwise apply, except for credential exfiltration, which always asks. Command examples or quoted commands alone are not execution authorization.
       For ordinary git push requests, pushing to the user's own fork or working branch is routine; pushing to main, master, release, production, prod, or another shared/production-like branch should be ask. Force-pushes are handled before classification by the danger list.
     timeoutMs: 15000
     extraDangerPatterns:
       - '\bkubectl\s+delete\b'
     dangerPatterns: null
+    trustedWriteRoots: []
+    trustDshHome: true
 ```
 
 Invalid regular expressions fail immediately while the plugin loads.
@@ -213,7 +220,9 @@ This plugin reduces approval prompts; it does not prove that a command is safe. 
 
 ### Workspace scope and command-line writes
 
-In `auto` mode, in-workspace `edit`/`write` targets retain automatic approval; outside or unresolvable targets go to human review before classification. The plugin also conservatively checks explicit output redirections and common write commands. Complex dynamic commands fall back to human review. This is not a complete shell parser and does not currently guarantee protection against symlink or junction escapes.
+In `auto` mode, `edit`/`write` targets inside the editable scope listed under Configuration (the workspace, temporary directories, custom editable directories, and by default the dsh home) retain automatic approval; targets outside that scope, or unresolvable ones, go to human review before classification. The path logic handles relative paths, `..`, sibling prefixes, and POSIX case.
+
+The command-line check conservatively covers explicit output redirections and common write commands. `cp`/`mv`/`ln`/`install` treat only the last operand (or the `-t`/`--target-directory` value) as the write destination; the other operands are read sources. Shapes that cannot be parsed reliably — `install -d`, unknown flags, truncated flag values — fall back to collecting every operand or to human review. Complex dynamic commands fall back to human review. This is not a complete shell parser and does not currently guarantee protection against symlink or junction escapes.
 
 ### What one automatic grant actually gives
 
@@ -225,7 +234,17 @@ Since 0.5.0 the default prompt approves writes inside the user's own tool and co
 
 This is a persistence and supply-chain path, and it is not bypassed but **configured open** — the shared shape of this failure mode is "a safeguard is relaxed for convenience, and behaviour then extends past the intended boundary", with no external compromise involved. The default takes this trade-off because the plugin's typical user is doing plugin and preset development; if your deployment does not need the agent to modify its own runtime, close it.
 
-Three ways to close it, pick one:
+The preferred way to close it is turning off dsh home trust (restating every field when overriding, see above):
+
+```yaml
+- id: auto-approve
+  config:
+    trustDshHome: false
+```
+
+This closes both gates at once: the deterministic scope check no longer trusts the harness home (`write`/`edit`/command-line writes go to human review), and the default prompt asks for operations that modify the harness runtime (installing or removing plugins, changing presets or profiles).
+
+The older alternatives remain available — extra danger patterns, [the strict prompt](#the-strict-prompt-optional), or `workspace-write` for those sessions:
 
 ```yaml
 - id: auto-approve
@@ -235,9 +254,7 @@ Three ways to close it, pick one:
       - '\bnpm\s+(?:i|install)\b[^\n]*-g\b'      # global installs
 ```
 
-Or switch to [the strict prompt](#the-strict-prompt-optional), or use `workspace-write` for those sessions.
-
-Use `workspace-write` when every escalation must receive human review. Add deployment-specific danger patterns for sensitive tools, and leave `dangerPatterns: null` unless you intend to replace the complete built-in protection. The classification request sends the command, justification, sandbox target, workspace path, and the complete newest genuine user message when it is at most 2,000 characters to the resolved LLM provider. A longer message is not sent in truncated form and instead goes directly to human review; account for that in your data-handling policy.
+Use `workspace-write` when every escalation must receive human review. Add deployment-specific danger patterns for sensitive tools, and leave `dangerPatterns: null` unless you intend to replace the complete built-in protection. The classification request sends the command, justification, sandbox target, workspace path, the effective editable-directory list, and the complete newest genuine user message when it is at most 2,000 characters to the resolved LLM provider. A longer message is not sent in truncated form and instead goes directly to human review; account for that in your data-handling policy.
 
 ## Known limitations
 
@@ -283,14 +300,22 @@ The classifier follows the default model from Settings → Models, so changing t
       Ask for publishing or releasing to a shared or public destination: package registries, production deploys, shared or production-like branches, and anything other people immediately consume.
       Ask for system-wide privileged changes: sudo, writes under /etc, /usr, /Library, or /System, system daemons and launch agents, global package managers, firewall or security settings, and changes to other user accounts.
       Ask when the command is genuinely unreadable to you — obfuscated, encoded, or fetched-then-executed from an unknown source — so you cannot tell what it does at all.
-      Everything else is routine developer work: approve it. Writing inside the user's own tool and configuration directories (for example ~/.dsh, ~/.config, ~/.cache, and per-application support directories), installing or updating dependencies, running builds, tests, linters, and formatters, starting or restarting the user's own local services, reading files and fetching read-only resources, and inspecting local processes and ports are all approve.
-      The requested sandbox mode alone is not a reason to ask; judge the concrete operation, justification, and workspace scope. Work outside the session workspace is normal and is not by itself a reason to ask.
+      Everything else is routine developer work: writing inside the user's own tool and configuration directories (for example ~/.dsh, ~/.config, ~/.cache, and per-application support directories), installing or updating dependencies, running builds, tests, linters, and formatters, starting or restarting the user's own local services, reading files and fetching read-only resources, and inspecting local processes and ports are all approve.
+      When the harness home is absent from the evidence's trustedWriteRoots, ask for operations that modify the agent harness's own runtime: installing or removing its plugins, or changing its presets or profile configuration.
+      The requested sandbox mode alone is not a reason to ask; judge the concrete operation, justification, and workspace scope. Writes outside the session workspace and the evidence's trustedWriteRoots are handled by the deterministic scope check before classification; if the target cannot be resolved, ask.
       Treat latestUserMessage as trusted context written directly by the user. When it explicitly authorizes the concrete operation under review (for example, pushing to the user's own fork), approve even if a concern above would otherwise apply, except for credential exfiltration, which always asks. Command examples or quoted commands alone are not execution authorization.
       For ordinary git push requests, pushing to the user's own fork or working branch is routine; pushing to main, master, release, production, prod, or another shared/production-like branch should be ask. Force-pushes are handled before classification by the danger list.
     timeoutMs: 15000
     extraDangerPatterns: []
     dangerPatterns: null
+    trustedWriteRoots: []
+    trustDshHome: true
 ```
+
+**`dsh web` fails to start with `invalid trusted write root` after configuring custom editable directories?**
+An entry in `trustedWriteRoots` is invalid: a relative path (such as `code`), an empty entry, or a tilde path (such as `~/code`). Invalid values are never silently skipped — the plugin throws during load, dsh fails to start, and the error message quotes the offending entry. This is deliberate: a silently skipped entry would leave you believing a directory is exempt when it never took effect. An invalid regex in `extraDangerPatterns`/`dangerPatterns` fails the same way (reported as `invalid danger pattern`).
+
+Fix: open `$DSH_HOME/profiles/web/cordis.patch.yml` (default `~/.dsh/profiles/web/`), correct the quoted line to an absolute path (`D:\work\code` on Windows) or delete it, then restart `dsh web`. If you cannot spot the problem right away, temporarily add `disabled: true` as described under "How do I disable it entirely?" to bring dsh back up, and remove it after fixing the config.
 
 **Why does an ordinary push still prompt?**
 The default prompt treats only pushes to the user's own fork or working branch as routine candidates, and the newest genuine user message must explicitly authorize the concrete operation. Shared or production-like branches such as `main`, `master`, `release`, `production`, and `prod` should still go to a human; force-pushes hit the danger list directly. Any classifier uncertainty also goes to a human.

@@ -38,7 +38,7 @@
 
 1. 从内存中的会话日志找回对应 `tool/call` 的原始参数，并读取最新一条真人用户消息：只接受 `user/message` 中 `source.kind === "user"` 的文本，忽略插件消息。消息不超过 2000 个字符时完整加入证据；超过上限则不截断猜测，直接转人工。
 2. 先用确定性危险清单检查 justification 和工具参数；混淆熔断会把带命令替换或进程替换的破坏性命令直接交给人工。
-3. 把命令、justification、目标沙箱模式、工作区路径和 `latestUserMessage` 交给配置的分类模型。真人消息里的明确授权可帮助判定具体操作，但命令示例和引用本身不算执行授权。
+3. 把命令、justification、目标沙箱模式、工作区路径、当前生效的可编辑目录列表和 `latestUserMessage` 交给配置的分类模型。真人消息里的明确授权可帮助判定具体操作，但命令示例和引用本身不算执行授权。
 4. 只有模型严格返回 `{"verdict":"approve"}` 时才返回 `allowed-once`；其他情况全部交给下一位应答者：Web UI、TUI 审批面板或 Desktop 内嵌 UI。
 
 内置危险清单覆盖破坏性 `rm -rf` 目标、设备写入与格式化、强制推送、下载后直接送入 shell、破坏性 SQL、主机关机、对根路径递归 `chmod 777`、shell fork 炸弹、Terraform/Pulumi 销毁，以及把 `rm`、`dd`、`mkfs`、`chmod` 或 `chown` 与 `$()`、反引号或 `<()` 组合的混淆写法。LLM 无法推翻已经命中的危险规则。
@@ -92,6 +92,10 @@ dsh plugin --profile web remove dsh-auto-approve
 | `timeoutMs` | `15000` | 分类调用的端到端超时，单位毫秒。 |
 | `extraDangerPatterns` | `[]` | 追加到内置清单的大小写不敏感正则。 |
 | `dangerPatterns` | `null` | `null` 保留内置清单；数组会整体替换内置清单。 |
+| `trustedWriteRoots` | `[]` | 自定义可编辑目录，一行一个绝对路径；写入这些目录（含子目录）不再转人工。非法条目（空、相对路径、`~`）在插件加载时报错。 |
+| `trustDshHome` | `true` | 是否把 dsh 自身目录（`$DSH_HOME`，默认 `~/.dsh`）也视为可编辑目录。设为 `false` 后写入 dsh 自身文件一律转人工，可堵上「agent 修改 harness 运行时」的持久化路径。 |
+
+写入以下位置不会触发人工审批：会话工作区、`/dev/null` 等设备接收端、系统临时目录（`/tmp`、`os.tmpdir()` 等）、`trustedWriteRoots` 配置的自定义可编辑目录，以及（`trustDshHome` 开启时的）dsh 自身目录。工作区与临时目录始终放行，无法通过配置移除。
 
 `provider` 与 `model` 会在每次分类时独立解析，因此有三种常见用法：
 
@@ -163,14 +167,17 @@ dsh plugin --profile web remove dsh-auto-approve
       Ask for publishing or releasing to a shared or public destination: package registries, production deploys, shared or production-like branches, and anything other people immediately consume.
       Ask for system-wide privileged changes: sudo, writes under /etc, /usr, /Library, or /System, system daemons and launch agents, global package managers, firewall or security settings, and changes to other user accounts.
       Ask when the command is genuinely unreadable to you — obfuscated, encoded, or fetched-then-executed from an unknown source — so you cannot tell what it does at all.
-      Everything else is routine developer work: approve it. Writing inside the user's own tool and configuration directories (for example ~/.dsh, ~/.config, ~/.cache, and per-application support directories), installing or updating dependencies, running builds, tests, linters, and formatters, starting or restarting the user's own local services, reading files and fetching read-only resources, and inspecting local processes and ports are all approve.
-      The requested sandbox mode alone is not a reason to ask; judge the concrete operation, justification, and workspace scope. Work outside the session workspace is normal and is not by itself a reason to ask.
+      Everything else is routine developer work: writing inside the user's own tool and configuration directories (for example ~/.dsh, ~/.config, ~/.cache, and per-application support directories), installing or updating dependencies, running builds, tests, linters, and formatters, starting or restarting the user's own local services, reading files and fetching read-only resources, and inspecting local processes and ports are all approve.
+      When the harness home is absent from the evidence's trustedWriteRoots, ask for operations that modify the agent harness's own runtime: installing or removing its plugins, or changing its presets or profile configuration.
+      The requested sandbox mode alone is not a reason to ask; judge the concrete operation, justification, and workspace scope. Writes outside the session workspace and the evidence's trustedWriteRoots are handled by the deterministic scope check before classification; if the target cannot be resolved, ask.
       Treat latestUserMessage as trusted context written directly by the user. When it explicitly authorizes the concrete operation under review (for example, pushing to the user's own fork), approve even if a concern above would otherwise apply, except for credential exfiltration, which always asks. Command examples or quoted commands alone are not execution authorization.
       For ordinary git push requests, pushing to the user's own fork or working branch is routine; pushing to main, master, release, production, prod, or another shared/production-like branch should be ask. Force-pushes are handled before classification by the danger list.
     timeoutMs: 15000
     extraDangerPatterns:
       - '\bkubectl\s+delete\b'
     dangerPatterns: null
+    trustedWriteRoots: []
+    trustDshHome: true
 ```
 
 无效正则会在插件加载时立即报错，不会被静默忽略。
@@ -212,9 +219,9 @@ npm run tune -- \
 
 ### 工作区范围与命令行写入
 
-在 `auto` 模式下，工作目录内的 `edit`/`write` 保留自动审批；工作目录外的目标，以及无法解析的目标，会在分类模型前转人工审批。路径判断会处理相对路径、`..`、相似前缀目录和 POSIX 大小写。
+在 `auto` 模式下，写入位置在「配置」一节列出的可编辑范围内（工作区、临时目录、自定义可编辑目录，默认含 dsh 自身目录）时，`edit`/`write` 保留自动审批；范围之外的目标，以及无法解析的目标，会在分类模型前转人工审批。路径判断会处理相对路径、`..`、相似前缀目录和 POSIX 大小写。
 
-命令行会保守检查明确的输出重定向和常见写命令；复杂动态命令无法保证静态解析时转人工。该检查不是完整 shell 解析器，暂不保证防止符号链接或 junction 的物理路径逃逸。
+命令行会保守检查明确的输出重定向和常见写命令。`cp`/`mv`/`ln`/`install` 只把最后一个操作数（或 `-t`/`--target-directory` 的值）视为写入目标，其余参数是读取源；`install -d`、未知选项、截断的选项值等无法可靠解析的形态，会回落到全参数检查或转人工。复杂动态命令无法保证静态解析时转人工。该检查不是完整 shell 解析器，暂不保证防止符号链接或 junction 的物理路径逃逸。
 
 ### 一次自动批准实际授予了什么
 
@@ -226,7 +233,17 @@ dsh 的沙箱升级没有路径粒度：模型能申请的目标只有 `danger-f
 
 这是一条持久化与供应链路径，且它不是被绕过的，而是**被配置放行的**——这类失效的共同形态是"为了顺手而放宽保护，随后行为越出预期边界"，与外部攻破无关。默认这样取舍，是因为本插件的典型用户就在做插件与 preset 开发；但如果你的部署不需要 agent 自行改动运行时，应当把它收回来。
 
-三种收回方式，任选：
+首选的收回方式是关闭 dsh 自身目录的信任（覆盖配置须重述全部字段，见上文）：
+
+```yaml
+- id: auto-approve
+  config:
+    trustDshHome: false
+```
+
+它会同时收掉两道闸门：确定性范围检查不再信任 harness home（`write`/`edit`/命令行写入一律转人工），默认提示词也会对修改 harness 运行时（安装/删除插件、改 preset/profile）的操作转 ask。
+
+也可以退回旧方案——追加危险正则、改用[严格档提示词](#严格档提示词可选)，或对这类会话直接使用 `workspace-write`：
 
 ```yaml
 - id: auto-approve
@@ -236,9 +253,7 @@ dsh 的沙箱升级没有路径粒度：模型能申请的目标只有 `danger-f
       - '\bnpm\s+(?:i|install)\b[^\n]*-g\b'      # 全局安装
 ```
 
-或改用[严格档提示词](#严格档提示词可选)，或对这类会话直接使用 `workspace-write`。
-
-需要逐次人工确认时请使用 `workspace-write`。应为敏感工具追加部署专属危险规则；除非明确要替换整套内置保护，否则保持 `dangerPatterns: null`。分类请求会把命令、justification、目标沙箱模式、工作区路径和不超过 2000 字符的最新真人用户消息发送给最终解析出的 LLM provider；更长的真人消息不会被截断发送，而是直接转人工。请将这一点纳入数据处理策略。
+需要逐次人工确认时请使用 `workspace-write`。应为敏感工具追加部署专属危险规则；除非明确要替换整套内置保护，否则保持 `dangerPatterns: null`。分类请求会把命令、justification、目标沙箱模式、工作区路径、当前生效的可编辑目录列表和不超过 2000 字符的最新真人用户消息发送给最终解析出的 LLM provider；更长的真人消息不会被截断发送，而是直接转人工。请将这一点纳入数据处理策略。
 
 ## 已知限制
 
@@ -284,14 +299,22 @@ DeepSeek Harness rc.6 的 Permissions 选择器尚未提供自定义预设图标
       Ask for publishing or releasing to a shared or public destination: package registries, production deploys, shared or production-like branches, and anything other people immediately consume.
       Ask for system-wide privileged changes: sudo, writes under /etc, /usr, /Library, or /System, system daemons and launch agents, global package managers, firewall or security settings, and changes to other user accounts.
       Ask when the command is genuinely unreadable to you — obfuscated, encoded, or fetched-then-executed from an unknown source — so you cannot tell what it does at all.
-      Everything else is routine developer work: approve it. Writing inside the user's own tool and configuration directories (for example ~/.dsh, ~/.config, ~/.cache, and per-application support directories), installing or updating dependencies, running builds, tests, linters, and formatters, starting or restarting the user's own local services, reading files and fetching read-only resources, and inspecting local processes and ports are all approve.
-      The requested sandbox mode alone is not a reason to ask; judge the concrete operation, justification, and workspace scope. Work outside the session workspace is normal and is not by itself a reason to ask.
+      Everything else is routine developer work: writing inside the user's own tool and configuration directories (for example ~/.dsh, ~/.config, ~/.cache, and per-application support directories), installing or updating dependencies, running builds, tests, linters, and formatters, starting or restarting the user's own local services, reading files and fetching read-only resources, and inspecting local processes and ports are all approve.
+      When the harness home is absent from the evidence's trustedWriteRoots, ask for operations that modify the agent harness's own runtime: installing or removing its plugins, or changing its presets or profile configuration.
+      The requested sandbox mode alone is not a reason to ask; judge the concrete operation, justification, and workspace scope. Writes outside the session workspace and the evidence's trustedWriteRoots are handled by the deterministic scope check before classification; if the target cannot be resolved, ask.
       Treat latestUserMessage as trusted context written directly by the user. When it explicitly authorizes the concrete operation under review (for example, pushing to the user's own fork), approve even if a concern above would otherwise apply, except for credential exfiltration, which always asks. Command examples or quoted commands alone are not execution authorization.
       For ordinary git push requests, pushing to the user's own fork or working branch is routine; pushing to main, master, release, production, prod, or another shared/production-like branch should be ask. Force-pushes are handled before classification by the danger list.
     timeoutMs: 15000
     extraDangerPatterns: []
     dangerPatterns: null
+    trustedWriteRoots: []
+    trustDshHome: true
 ```
+
+**配置了自定义可编辑目录后 `dsh web` 启动失败，报 `invalid trusted write root`？**
+`trustedWriteRoots` 里出现了非法条目：相对路径（如 `code`）、空条目，或以 `~` 开头的路径（如 `~/code`）。非法值不会被静默跳过——插件加载时立即报错，dsh 启动直接失败，错误信息里带有该条目的原文。这是有意的安全设计：被静默跳过的条目会让你以为某目录已免审批，实际却没有生效。`extraDangerPatterns`/`dangerPatterns` 写了无效正则是同样的现象（报 `invalid danger pattern`）。
+
+解决：打开 `$DSH_HOME/profiles/web/cordis.patch.yml`（默认 `~/.dsh/profiles/web/`），把报错指出的那一行改成绝对路径（Windows 下形如 `D:\work\code`）或删掉该行，保存后重启 `dsh web`。一时定位不了问题时，可先按上文「怎么彻底停用」加 `disabled: true` 让 dsh 恢复启动，修好配置后再去掉。
 
 **为什么普通 push 仍然弹窗？**
 默认提示只把推送到用户自己的 fork 或工作分支视为例行候选，而且最新真人消息必须明确授权当前具体操作。`main`、`master`、`release`、`production`、`prod` 等共享/生产类分支仍应转人工；force push 会直接命中危险清单。模型只要拿不准也会转人工。
