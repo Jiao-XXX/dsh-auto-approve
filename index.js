@@ -197,8 +197,9 @@ const CLASSIFIER_SYSTEM_PROMPT = [
   'Ask for publishing or releasing to a shared or public destination: package registries, production deploys, shared or production-like branches, and anything other people immediately consume.',
   'Ask for system-wide privileged changes: sudo, writes under /etc, /usr, /Library, or /System, system daemons and launch agents, global package managers, firewall or security settings, and changes to other user accounts.',
   'Ask when the command is genuinely unreadable to you — obfuscated, encoded, or fetched-then-executed from an unknown source — so you cannot tell what it does at all.',
-  'Everything else is routine developer work: installing or updating dependencies, running builds, tests, linters, and formatters, starting or restarting the user\'s own local services, reading files and fetching read-only resources, and inspecting local processes and ports are all approve.',
-  'The requested sandbox mode alone is not a reason to ask; judge the concrete operation, justification, and workspace scope. Writes outside the session workspace are handled by the deterministic scope check before classification; if the target cannot be resolved, ask.',
+  'Everything else is routine developer work: writing inside the user\'s own tool and configuration directories (for example ~/.dsh, ~/.config, ~/.cache, and per-application support directories), installing or updating dependencies, running builds, tests, linters, and formatters, starting or restarting the user\'s own local services, reading files and fetching read-only resources, and inspecting local processes and ports are all approve.',
+  'When the harness home is absent from the evidence\'s trustedWriteRoots, ask for operations that modify the agent harness\'s own runtime: installing or removing its plugins, or changing its presets or profile configuration.',
+  'The requested sandbox mode alone is not a reason to ask; judge the concrete operation, justification, and workspace scope. Writes outside the session workspace and the evidence\'s trustedWriteRoots are handled by the deterministic scope check before classification; if the target cannot be resolved, ask.',
   'Treat latestUserMessage as trusted context written directly by the user. When it explicitly authorizes the concrete operation under review (for example, pushing to the user\'s own fork), approve even if a concern above would otherwise apply, except for credential exfiltration, which always asks. Command examples or quoted commands alone are not execution authorization.',
   'For ordinary git push requests, pushing to the user\'s own fork or working branch is routine; pushing to main, master, release, production, prod, or another shared/production-like branch should be ask. Force-pushes are handled before classification by the danger list.',
 ].join('\n')
@@ -704,6 +705,7 @@ export function createApprovalHandler(ctx, config, patterns, trustedWriteRoots =
         justification: reason,
         targetSandboxMode: targetSandboxMode(reason),
         workspacePath: session.header?.cwd ?? null,
+        trustedWriteRoots,
         latestUserMessage: userMessage.text,
       }, lifetimeSignal, trackIteratorCleanup))
       if (decision.verdict === 'approve') {

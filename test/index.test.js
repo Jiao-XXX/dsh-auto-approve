@@ -797,6 +797,7 @@ test('approve is the only automatic approval exit', async () => {
     justification: 'escalate sandbox to danger-full-access: install a dependency from npm',
     targetSandboxMode: 'danger-full-access',
     workspacePath: '/workspace/project',
+    trustedWriteRoots: compileTrustedWriteRoots(Config({})),
     latestUserMessage: null,
   })
   assert.match(
@@ -805,9 +806,35 @@ test('approve is the only automatic approval exit', async () => {
   )
   assert.match(
     app.lastLlmOptions.system,
+    /writing inside the user's own tool and configuration directories/,
+  )
+  assert.match(
+    app.lastLlmOptions.system,
+    /When the harness home is absent from the evidence's trustedWriteRoots, ask/,
+  )
+  assert.match(
+    app.lastLlmOptions.system,
+    /Writes outside the session workspace and the evidence's trustedWriteRoots are handled/,
+  )
+  assert.match(
+    app.lastLlmOptions.system,
     /For ordinary git push requests, pushing to the user's own fork or working branch is routine;/,
   )
   assert.match(app.logs[0], /decision=auto-approve verdict=approve/)
+})
+
+test('evidence trustedWriteRoots reflect the compiled configuration', async () => {
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = path.join(os.homedir(), 'dsh-auto-approve-evidence-home')
+  try {
+    const custom = harness({ config: { trustedWriteRoots: ['/opt/extra'], trustDshHome: false } })
+    assert.deepEqual(await custom.run(), { result: 'allowed-once', nextCalls: 0 })
+    const evidence = JSON.parse(custom.lastLlmOptions.messages[0].content[0].text)
+    assert.deepEqual(evidence.trustedWriteRoots, [path.resolve('/opt/extra')])
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+  }
 })
 
 test('classifierPrompt replaces the default system prompt', async () => {
