@@ -1,13 +1,12 @@
 import { findOutsideWorkspaceWrite } from '../index.js'
 
 // Owner's acceptance matrix from the review, workspace /Users/me/project.
-// Expected values reflect the behavior AFTER commit 1 (device sinks + tmpdir).
-// cp/ln source-argument cases remain ASK until commit 2.
+// Expected values reflect the behavior AFTER commit 2 (destination semantics).
 const cases = [
   ['ALLOW', 'npm test > /dev/null 2>&1'],
   ['ALLOW', 'make build 2>/dev/null'],
-  ['ASK  ', 'cp ~/.gitconfig ./backup.txt'],
-  ['ASK  ', 'ln -s /usr/local/bin/node ./node'],
+  ['ALLOW', 'cp ~/.gitconfig ./backup.txt'],
+  ['ALLOW', 'ln -s /usr/local/bin/node ./node'],
   ['ALLOW', 'echo hi > ./out.txt'],
   ['ALLOW', 'cp ./a.txt ./b.txt'],
   ['ALLOW', 'chmod +x ./script.sh'],

@@ -264,6 +264,50 @@ test('the platform temporary directory is an exempt write target', () => {
   assert.notEqual(findOutsideWorkspaceWrite('echo x > /var/folders/zz/out.log', '/Users/me/project'), undefined)
 })
 
+test('copy-like commands treat only the destination operand as a write target', () => {
+  for (const [command, expected] of [
+    ['cp ~/.gitconfig ./backup.txt', undefined],
+    ['ln -s /usr/local/bin/node ./node', undefined],
+    ['mv ~/secret.txt ./in.txt', undefined],
+    ['install ./a.sh ./b.sh', undefined],
+    ['cp a b', undefined],
+    ['cp ./a.txt /etc/bak', '/etc/bak'],
+    ['mv ./source ../outside', '../outside'],
+    ['cp a b /etc/dir/', '/etc/dir/'],
+    ['cp -t /etc ./a.txt', '/etc'],
+    ['cp --target-directory=/etc a', '/etc'],
+    ['cp --target-directory /etc a', '/etc'],
+    ['cp -rt /etc a b', '/etc'],
+    ['install -m 755 ./a.sh /usr/local/bin/a.sh', '/usr/local/bin/a.sh'],
+    ['cp -S .bak src dst', undefined],
+    ['cp --suffix .bak src dst', undefined],
+    ['cp -q ~/.gitconfig ./b', '~/.gitconfig'],
+    ['cp -Zcontext src /etc/dst', '/etc/dst'],
+  ]) {
+    assert.equal(findOutsideWorkspaceWrite(command, '/Users/me/project'), expected, command)
+  }
+})
+
+test('install directory mode and unparseable shapes fall back to collecting every path operand', () => {
+  for (const command of [
+    'install -d /a /b',
+    'install --directory /a /b',
+    'cp -Q /a /b',
+    'cp --unknown-flag /a /b',
+  ]) {
+    assert.notEqual(findOutsideWorkspaceWrite(command, '/Users/me/project'), undefined, command)
+  }
+})
+
+test('copy commands with a truncated flag value fail closed before classification', async () => {
+  for (const command of ['cp -S', 'cp --target-directory']) {
+    const app = harness()
+    assert.deepEqual(await app.run(requestOf({ command })), { result: MANUAL, nextCalls: 1 }, command)
+    assert.equal(app.llmCalls, 0, command)
+    assert.match(app.logs[0], /unresolved-write-target/, command)
+  }
+})
+
 test('harness configuration directories are currently outside-workspace writes', async () => {
   for (const filePath of ['~/.dsh/profiles/default.yml', '~/.dsh/.agent-presets/auto.yml']) {
     const app = harness()

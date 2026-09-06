@@ -8,6 +8,8 @@ const WRITE_PATH_COMMANDS = /(?:^|[;&|]\s*)(?:sudo\s+)?(?:tee|touch|mkdir|instal
 const DYNAMIC_WRITE_COMMANDS = /(?:^|[^\w])(?:sudo\s+)?(?:python(?:3)?\s+-c|node\s+-e|(?:ba|z|k)?sh\s+-c|powershell(?:\.exe)?\s+-command|pwsh\s+-command|xargs)\b/i
 // Device sinks and conventional temporary locations are trusted non-workspace write targets.
 const ALLOWED_WRITE_PATH = /^(?:nul$|[a-z]:[\\/]+users[\\/]+[^\\/]+[\\/]appdata[\\/]local[\\/]temp(?:[\\/]|$)|[\\/]tmp(?:[\\/]|$)|[\\/]var[\\/]tmp(?:[\\/]|$)|[\\/]dev[\\/](?:null|stdout|stderr)(?:[\\/]|$)|%temp%(?:[\\/]|$)|\$tmpdir(?:[\\/]|$))/i
+// Only the last operand of these verbs is a write destination; earlier operands are read sources.
+const DESTINATION_COMMANDS = /^(?:install|cp|mv|ln)$/
 
 function normalizePath(value) {
   const text = String(value).replace(/[\\/]+/g, '/')
@@ -61,12 +63,80 @@ function extractWriteTargets(command) {
   for (const match of String(command).matchAll(/(?<![<])(?:[0-9]+)?(?:>>|>|>&|&>)\s*(?:"([^"\\]*(?:\\.[^"\\]*)*)"|'([^']*)'|([^\s;&|]+))/g)) {
     targets.push(match[1] ?? match[2] ?? match[3])
   }
-  for (const match of String(command).matchAll(/(?:^|[;&|]\s*)(?:sudo\s+)?(?:tee|touch|mkdir|install|cp|mv|ln|chmod|chown|sed\s+-[^\n]*i|perl\s+-[^\n]*i)\b([^\n;&|]*)/gi)) {
-    for (const token of shellTokens(match[1])) {
+  for (const match of String(command).matchAll(/(?:^|[;&|]\s*)(?:sudo\s+)?(tee|touch|mkdir|install|cp|mv|ln|chmod|chown|(?:sed|perl)\s+-[^\n]*i)\b([^\n;&|]*)/gi)) {
+    const verb = match[1].toLowerCase()
+    if (DESTINATION_COMMANDS.test(verb)) {
+      // Unparseable shapes return undefined and fall back to collecting every path-like token below.
+      const destination = copyDestination(verb, match[2])
+      if (destination !== undefined) {
+        if (destination !== '') targets.push(destination)
+        continue
+      }
+    }
+    for (const token of shellTokens(match[2])) {
       if (!token.startsWith('-') && (token.includes('/') || token.includes('\\') || token.startsWith('~') || token === '.' || token === '..')) targets.push(token)
     }
   }
   return targets
+}
+
+/** Return the write destination of a cp/mv/ln/install invocation, or undefined when unparseable. */
+function copyDestination(verb, rest) {
+  const tokens = shellTokens(rest)
+  const operands = []
+  let targetDirectory
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]
+    if (token === '--') {
+      operands.push(...tokens.slice(index + 1))
+      break
+    }
+    if (token.startsWith('--')) {
+      const target = /^--target-directory(?:=(.*))?$/.exec(token)
+      if (target !== null) {
+        if (target[1] !== undefined) targetDirectory = target[1]
+        else if (tokens[index + 1] !== undefined) targetDirectory = tokens[++index]
+        else return undefined
+      } else if (/^--(?:suffix|mode|owner|group|context|strip-program|preserve|backup)(?!=)/.test(token)) {
+        if (tokens[index + 1] === undefined) return undefined
+        index += 1
+      } else if (verb === 'install' && /^--directory$/.test(token)) {
+        return undefined
+      } else if (/^--(?:no-target-directory|interactive|force|link|symbolic|directory|verbose|update|archive|recursive|no-clobber|strip|compare|preserve-timestamps|parents|attributes-only|one-file-system|copy-contents|dereference|no-dereference|relative|logical|physical|sparse|reflink)(?==|$)/.test(token)) {
+        continue
+      } else if (!token.includes('=')) {
+        return undefined
+      }
+      continue
+    }
+    if (token.startsWith('-') && token !== '-') {
+      for (let position = 1; position < token.length; position += 1) {
+        const letter = token[position]
+        if (letter === 't') {
+          const inline = token.slice(position + 1)
+          if (inline.length > 0) targetDirectory = inline
+          else if (tokens[index + 1] !== undefined) targetDirectory = tokens[++index]
+          else return undefined
+          break
+        }
+        if ('SgmoZ'.includes(letter)) {
+          const inline = token.slice(position + 1)
+          if (inline.length === 0) {
+            if (tokens[index + 1] === undefined) return undefined
+            index += 1
+          }
+          break
+        }
+        if (verb === 'install' && letter === 'd') return undefined
+        if ('bCcDdFfiLlnPpRrsStTuvxZz'.includes(letter)) continue
+        return undefined
+      }
+      continue
+    }
+    operands.push(token)
+  }
+  if (targetDirectory !== undefined) return targetDirectory
+  return operands.length > 0 ? operands.at(-1) : undefined
 }
 
 /** Detect explicit writes outside cwd while allowing conventional temp paths. */
