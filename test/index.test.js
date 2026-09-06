@@ -1,4 +1,6 @@
 import assert from 'node:assert/strict'
+import os from 'node:os'
+import path from 'node:path'
 import test from 'node:test'
 import {
   Config,
@@ -235,6 +237,31 @@ test('write scope detection distinguishes Windows workspace siblings and tempora
   assert.equal(findOutsideWorkspaceWrite('echo x > C:\\work\\project\\src\\..\\out.txt', workspace), undefined)
   assert.notEqual(findOutsideWorkspaceWrite('echo x > C:\\work\\project-other\\out.txt', workspace), undefined)
   assert.equal(findOutsideWorkspaceWrite('echo x > C:\\Users\\tester\\AppData\\Local\\Temp\\out.txt', workspace), undefined)
+  assert.equal(findOutsideWorkspaceWrite('echo x > NUL', workspace), undefined)
+  assert.equal(findOutsideWorkspaceWrite('echo x > C:\\work\\project\\NUL', workspace), undefined)
+})
+
+test('device sinks are exempt write targets on every platform spelling', () => {
+  for (const command of [
+    'npm test > /dev/null 2>&1',
+    'make build 2>/dev/null',
+    'echo x > /dev/null',
+    'echo x > /dev/stdout',
+    'echo x > /dev/stderr',
+    'echo x > nul',
+  ]) {
+    assert.equal(findOutsideWorkspaceWrite(command, '/Users/me/project'), undefined, command)
+  }
+  assert.notEqual(findOutsideWorkspaceWrite('echo x > /dev/nulls', '/Users/me/project'), undefined)
+  assert.notEqual(findOutsideWorkspaceWrite('echo x > /dev', '/Users/me/project'), undefined)
+  assert.notEqual(findOutsideWorkspaceWrite('echo x > /dev/null/..', '/Users/me/project'), undefined)
+})
+
+test('the platform temporary directory is an exempt write target', () => {
+  const temp = os.tmpdir()
+  assert.equal(findOutsideWorkspaceWrite(`echo x > ${temp}${path.sep}out.log`, '/Users/me/project'), undefined)
+  assert.equal(findOutsideWorkspaceWrite(`echo x > ${temp}${path.sep}a${path.sep}b.log`, '/Users/me/project'), undefined)
+  assert.notEqual(findOutsideWorkspaceWrite('echo x > /var/folders/zz/out.log', '/Users/me/project'), undefined)
 })
 
 test('harness configuration directories are currently outside-workspace writes', async () => {

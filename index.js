@@ -6,7 +6,8 @@ import { DEFAULT_DANGER_PATTERNS } from './danger-patterns.js'
 
 const WRITE_PATH_COMMANDS = /(?:^|[;&|]\s*)(?:sudo\s+)?(?:tee|touch|mkdir|install|cp|mv|ln|chmod|chown|sed\s+-[^\n]*i|perl\s+-[^\n]*i)\b/i
 const DYNAMIC_WRITE_COMMANDS = /(?:^|[^\w])(?:sudo\s+)?(?:python(?:3)?\s+-c|node\s+-e|(?:ba|z|k)?sh\s+-c|powershell(?:\.exe)?\s+-command|pwsh\s+-command|xargs)\b/i
-const TEMP_PATH = /^(?:[a-z]:[\\/]+users[\\/]+[^\\/]+[\\/]appdata[\\/]local[\\/]temp(?:[\\/]|$)|[\\/]tmp(?:[\\/]|$)|[\\/]var[\\/]tmp(?:[\\/]|$)|%temp%(?:[\\/]|$)|\$tmpdir(?:[\\/]|$))/i
+// Device sinks and conventional temporary locations are trusted non-workspace write targets.
+const ALLOWED_WRITE_PATH = /^(?:nul$|[a-z]:[\\/]+users[\\/]+[^\\/]+[\\/]appdata[\\/]local[\\/]temp(?:[\\/]|$)|[\\/]tmp(?:[\\/]|$)|[\\/]var[\\/]tmp(?:[\\/]|$)|[\\/]dev[\\/](?:null|stdout|stderr)(?:[\\/]|$)|%temp%(?:[\\/]|$)|\$tmpdir(?:[\\/]|$))/i
 
 function normalizePath(value) {
   const text = String(value).replace(/[\\/]+/g, '/')
@@ -15,8 +16,23 @@ function normalizePath(value) {
     : path.posix.normalize(text)
 }
 
-function isAllowedTemporaryPath(value) {
-  return TEMP_PATH.test(normalizePath(value))
+function isAllowedWritePath(value) {
+  const normalized = normalizePath(value)
+  if (ALLOWED_WRITE_PATH.test(normalized)) return true
+  const temp = normalizePath(os.tmpdir()).replace(/\/+$/, '').toLowerCase()
+  // A root-only tmpdir is ignored so a degraded value cannot exempt every write.
+  if (temp.split('/').filter(Boolean).length <= 1) return false
+  return isInsideRoot(value, temp, temp)
+}
+
+function isInsideRoot(raw, rootPath, workspacePath) {
+  const original = String(raw).replace(/^['"]|['"]$/g, '')
+  if (/^~/.test(original) || original.includes('\0')) return false
+  const windows = /^[a-z]:[\\/]/i.test(original) || /^[a-z]:[\\/]/i.test(workspacePath)
+  const api = windows ? path.win32 : path.posix
+  const relative = api.relative(api.resolve(rootPath), api.resolve(api.resolve(workspacePath), original))
+  const compared = windows ? relative.toLowerCase() : relative
+  return compared === '' || (!compared.startsWith('..') && !api.isAbsolute(relative))
 }
 
 function isOutsideWorkspace(raw, workspacePath) {
@@ -57,7 +73,7 @@ function extractWriteTargets(command) {
 export function findOutsideWorkspaceWrite(command, workspacePath) {
   if (typeof command !== 'string' || typeof workspacePath !== 'string' || workspacePath.length === 0) return undefined
   for (const raw of extractWriteTargets(command)) {
-    if (!isAllowedTemporaryPath(raw) && isOutsideWorkspace(raw, workspacePath)) return raw
+    if (!isAllowedWritePath(raw) && isOutsideWorkspace(raw, workspacePath)) return raw
   }
   return undefined
 }
