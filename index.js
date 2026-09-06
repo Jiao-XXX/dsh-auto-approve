@@ -37,7 +37,7 @@ function isInsideRoot(raw, rootPath, workspacePath) {
   return compared === '' || (!compared.startsWith('..') && !api.isAbsolute(relative))
 }
 
-function isOutsideWorkspace(raw, workspacePath) {
+function isOutsideTrustedRoots(raw, workspacePath, roots = []) {
   const original = String(raw).replace(/^['"]|['"]$/g, '')
   if (/^~[^\\/]/.test(original)) return true
   const value = original.startsWith('~/') || original.startsWith('~\\')
@@ -50,7 +50,9 @@ function isOutsideWorkspace(raw, workspacePath) {
   const target = api.resolve(root, value)
   const relative = api.relative(root, target)
   const compared = windows ? relative.toLowerCase() : relative
-  return compared !== '' && (compared === '..' || compared.startsWith(`..${api.sep}`) || api.isAbsolute(relative))
+  const outside = compared !== '' && (compared === '..' || compared.startsWith(`..${api.sep}`) || api.isAbsolute(relative))
+  // Configured absolute roots extend the trusted write boundary beyond the workspace.
+  return outside && roots.every(trustedRoot => !isInsideRoot(target, trustedRoot, workspacePath))
 }
 
 function shellTokens(value) {
@@ -139,16 +141,16 @@ function copyDestination(verb, rest) {
   return operands.length > 0 ? operands.at(-1) : undefined
 }
 
-/** Detect explicit writes outside cwd while allowing conventional temp paths. */
-export function findOutsideWorkspaceWrite(command, workspacePath) {
+/** Detect explicit writes outside the workspace and trusted roots, allowing device sinks and temp paths. */
+export function findOutsideWorkspaceWrite(command, workspacePath, trustedWriteRoots = []) {
   if (typeof command !== 'string' || typeof workspacePath !== 'string' || workspacePath.length === 0) return undefined
   for (const raw of extractWriteTargets(command)) {
-    if (!isAllowedWritePath(raw) && isOutsideWorkspace(raw, workspacePath)) return raw
+    if (!isAllowedWritePath(raw) && isOutsideTrustedRoots(raw, workspacePath, trustedWriteRoots)) return raw
   }
   return undefined
 }
 
-function writeScopeViolation(command, workspacePath, toolName, toolArguments) {
+function writeScopeViolation(command, workspacePath, toolName, toolArguments, trustedWriteRoots = []) {
   const isFileMutationTool = toolName === 'write' || toolName === 'edit'
   if (isFileMutationTool) {
     let rawTarget
@@ -159,7 +161,8 @@ function writeScopeViolation(command, workspacePath, toolName, toolArguments) {
       return 'unresolved-write-target'
     }
     if (typeof rawTarget !== 'string' || rawTarget.length === 0) return 'unresolved-write-target'
-    return typeof workspacePath !== 'string' || workspacePath.length === 0 || isOutsideWorkspace(rawTarget, workspacePath)
+    return typeof workspacePath !== 'string' || workspacePath.length === 0
+      || (!isAllowedWritePath(rawTarget) && isOutsideTrustedRoots(rawTarget, workspacePath, trustedWriteRoots))
       ? rawTarget
       : undefined
   }
@@ -172,7 +175,7 @@ function writeScopeViolation(command, workspacePath, toolName, toolArguments) {
   if (/\$\{|\$[A-Za-z_][A-Za-z0-9_]*|%[^%]+%/.test(command)) return 'dynamic-write-target'
   const targets = extractWriteTargets(command)
   if (targets.length === 0) return 'unresolved-write-target'
-  return findOutsideWorkspaceWrite(command, workspacePath)
+  return findOutsideWorkspaceWrite(command, workspacePath, trustedWriteRoots)
 }
 
 export { DEFAULT_DANGER_PATTERNS } from './danger-patterns.js'
@@ -225,6 +228,8 @@ export const Config = Schema.object({
     Schema.array(Schema.string()),
     Schema.const(null),
   ]).default(null),
+  trustedWriteRoots: Schema.array(Schema.string().min(1)).default([]),
+  trustDshHome: Schema.boolean().default(true),
 })
 
 function classifierModelSelection(ctx, config) {
@@ -256,6 +261,24 @@ export function compileDangerPatterns(config) {
       throw new Error(`dsh-auto-approve: invalid danger pattern ${JSON.stringify(source)}: ${String(error)}`)
     }
   })
+}
+
+/** Compile the configured trusted write roots once while the plugin loads. */
+export function compileTrustedWriteRoots(config, env = process.env) {
+  const roots = (config.trustedWriteRoots ?? []).map((source) => {
+    const trimmed = String(source).trim()
+    if (trimmed.length === 0 || !path.isAbsolute(trimmed)) {
+      throw new Error(`dsh-auto-approve: invalid trusted write root ${JSON.stringify(source)}: expected an absolute path such as /Users/you/code or D:\\work\\code`)
+    }
+    return path.resolve(trimmed)
+  })
+  if (config.trustDshHome === false) return roots
+  // Mirrors dsh resolveDshHome: a non-blank $DSH_HOME (~ expanded) wins over ~/.dsh.
+  const fromEnv = env.DSH_HOME
+  const home = fromEnv !== undefined && fromEnv.trim().length > 0 ? fromEnv.trim() : path.join(os.homedir(), '.dsh')
+  return [...roots, path.resolve(home === '~' || home.startsWith('~/') || home.startsWith('~\\')
+    ? path.join(os.homedir(), home.slice(1))
+    : home)]
 }
 
 /** Return the first deterministic danger match, if any. */
@@ -605,7 +628,7 @@ function cancellationDetail(req, lifetimeSignal) {
 }
 
 /** Build the waterfall listener separately so unit tests can exercise it directly. */
-export function createApprovalHandler(ctx, config, patterns, lifecycle = {}) {
+export function createApprovalHandler(ctx, config, patterns, trustedWriteRoots = [], lifecycle = {}) {
   const trackClassification = lifecycle.trackClassification
     ?? (operation => Promise.resolve().then(operation))
   const lifetimeSignal = lifecycle.signal
@@ -653,7 +676,7 @@ export function createApprovalHandler(ctx, config, patterns, lifecycle = {}) {
         return delegate()
       }
 
-      const outsideWrite = writeScopeViolation(command, session.header?.cwd, req.toolName, toolArguments)
+      const outsideWrite = writeScopeViolation(command, session.header?.cwd, req.toolName, toolArguments, trustedWriteRoots)
       if (outsideWrite !== undefined) {
         record('danger', `outside-workspace-write=${inlineSummary(outsideWrite, COMMAND_SUMMARY_MAX_CHARS)}`)
         logDecision(ctx, 'manual', `outside-workspace-write=${JSON.stringify(outsideWrite)}`)
@@ -721,6 +744,7 @@ export function apply(ctx, config = {}) {
   // also keeps direct apply(ctx, bareObject) unit tests faithful to that boundary.
   const resolved = Config(config)
   const patterns = compileDangerPatterns(resolved)
+  const trustedWriteRoots = compileTrustedWriteRoots(resolved)
   const reportBySession = new Map()
   ctx.effect(() => {
     const lifetime = new AbortController()
@@ -742,7 +766,7 @@ export function apply(ctx, config = {}) {
 
     const disposeListener = ctx.on(
       'approval/request',
-      createApprovalHandler(ctx, resolved, patterns, {
+      createApprovalHandler(ctx, resolved, patterns, trustedWriteRoots, {
         signal: lifetime.signal,
         trackClassification,
         trackIteratorCleanup,

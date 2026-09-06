@@ -7,6 +7,7 @@ import {
   DEFAULT_DANGER_PATTERNS,
   apply,
   compileDangerPatterns,
+  compileTrustedWriteRoots,
   findDangerMatch,
   findOutsideWorkspaceWrite,
   parseClassifierVerdict,
@@ -308,13 +309,83 @@ test('copy commands with a truncated flag value fail closed before classificatio
   }
 })
 
-test('harness configuration directories are currently outside-workspace writes', async () => {
-  for (const filePath of ['~/.dsh/profiles/default.yml', '~/.dsh/.agent-presets/auto.yml']) {
+test('harness configuration directories stay trusted by default and can be untrusted', async () => {
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = path.join(os.homedir(), '.dsh')
+  try {
+    for (const filePath of ['~/.dsh/profiles/default.yml', '~/.dsh/.agent-presets/auto.yml']) {
+      const request = requestOf({ toolName: 'write', command: filePath })
+      const app = harness()
+      assert.deepEqual(await app.run(request), { result: 'allowed-once', nextCalls: 0 }, filePath)
+      assert.equal(app.llmCalls, 1, filePath)
+      const strict = harness({ config: { trustDshHome: false } })
+      assert.deepEqual(await strict.run(requestOf({ toolName: 'write', command: filePath })), { result: MANUAL, nextCalls: 1 }, filePath)
+      assert.equal(strict.llmCalls, 0, filePath)
+      assert.match(strict.logs[0], /outside-workspace-write/, filePath)
+    }
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+  }
+})
+
+test('a custom $DSH_HOME is the trusted root instead of ~/.dsh', async () => {
+  const previous = process.env.DSH_HOME
+  const custom = path.join(os.homedir(), 'dsh-auto-approve-custom-home')
+  process.env.DSH_HOME = custom
+  try {
     const app = harness()
-    const request = requestOf({ toolName: 'write', command: filePath })
-    assert.deepEqual(await app.run(request), { result: MANUAL, nextCalls: 1 }, filePath)
-    assert.equal(app.llmCalls, 0, filePath)
-    assert.match(app.logs[0], /outside-workspace-write/)
+    assert.deepEqual(
+      await app.run(requestOf({ toolName: 'write', command: path.join(custom, 'profiles', 'default.yml') })),
+      { result: 'allowed-once', nextCalls: 0 },
+    )
+    assert.equal(app.llmCalls, 1)
+    const tilde = harness()
+    assert.deepEqual(
+      await tilde.run(requestOf({ toolName: 'write', command: '~/.dsh/profiles/default.yml' })),
+      { result: MANUAL, nextCalls: 1 },
+    )
+    assert.equal(tilde.llmCalls, 0)
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+  }
+})
+
+test('configured trusted write roots extend the boundary for tools and commands', async () => {
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = path.join(os.homedir(), 'dsh-auto-approve-unrelated-home')
+  const root = path.join(os.homedir(), 'dsh-auto-approve-trusted-root')
+  const target = path.join(root, 'out.txt')
+  try {
+    for (const [toolName, command] of [['write', target], ['bash', `cp ./a.txt "${target}"`]]) {
+      const app = harness({ config: { trustedWriteRoots: [root] } })
+      assert.deepEqual(await app.run(requestOf({ toolName, command })), { result: 'allowed-once', nextCalls: 0 }, command)
+      assert.equal(app.llmCalls, 1, command)
+    }
+    const bare = harness()
+    assert.deepEqual(await bare.run(requestOf({ toolName: 'write', command: target })), { result: MANUAL, nextCalls: 1 })
+    assert.equal(bare.llmCalls, 0)
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+  }
+})
+
+test('compileTrustedWriteRoots validates entries and resolves the harness home', () => {
+  const home = path.join(os.homedir(), 'dsh-home-test')
+  assert.deepEqual(
+    compileTrustedWriteRoots({ trustedWriteRoots: ['/opt/a', 'D:\\work\\b'] }, { DSH_HOME: home }),
+    [path.resolve('/opt/a'), path.resolve('D:\\work\\b'), path.resolve(home)],
+  )
+  assert.deepEqual(
+    compileTrustedWriteRoots({ trustedWriteRoots: ['/opt/a'], trustDshHome: false }, { DSH_HOME: home }),
+    [path.resolve('/opt/a')],
+  )
+  assert.deepEqual(compileTrustedWriteRoots({}, { DSH_HOME: '  ' }), [path.resolve(path.join(os.homedir(), '.dsh'))])
+  assert.deepEqual(compileTrustedWriteRoots({}, { DSH_HOME: '~/env-dsh' }), [path.join(os.homedir(), 'env-dsh')])
+  for (const entry of ['relative/path', '', ' ', '~/code', '~', '.']) {
+    assert.throws(() => compileTrustedWriteRoots({ trustedWriteRoots: [entry] }, {}), /invalid trusted write root/, entry)
   }
 })
 
@@ -1312,5 +1383,17 @@ test('invalid regular expressions fail loudly at plugin load', () => {
   assert.throws(
     () => apply(ctx, { extraDangerPatterns: ['['] }),
     /dsh-auto-approve: invalid danger pattern/,
+  )
+})
+
+test('invalid trusted write roots fail loudly at plugin load', () => {
+  const ctx = {
+    get: () => undefined,
+    on: () => { throw new Error('listener must not register') },
+    logger: { info() {} },
+  }
+  assert.throws(
+    () => apply(ctx, { trustedWriteRoots: ['relative/path'] }),
+    /dsh-auto-approve: invalid trusted write root/,
   )
 })
