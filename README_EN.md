@@ -11,6 +11,7 @@
 <p align="center">
   <a href="https://github.com/Jiao-XXX/dsh-auto-approve/actions/workflows/test.yml"><img src="https://github.com/Jiao-XXX/dsh-auto-approve/actions/workflows/test.yml/badge.svg" alt="test status"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license: MIT"></a>
+  <a href="https://dsh.directory/plugins/jiao-xxx/dsh-auto-approve"><img src="https://dsh.directory/badges/listed.svg" alt="Listed on DSH Directory"></a>
 </p>
 
 English | [中文](README.md)
@@ -65,7 +66,15 @@ This package ships **no runtime dependencies**: `@deepseek-ai/schemastery` is de
 
 DeepSeek Harness must run on a supported Node.js version. The host-side plugin is pure ESM JavaScript, and the browser registration script is committed directly as a runtime file. The package has no `build`, `prepare`, or `install` script, so installing it from Git does not require pnpm build authorization.
 
-From GitHub:
+From npm (recommended):
+
+```bash
+dsh plugin --profile web add dsh-auto-approve
+```
+
+The npm release is the fully tested one and the form listed on [DSH Directory](https://dsh.directory/plugins/jiao-xxx/dsh-auto-approve).
+
+From GitHub (for changes that are not released yet):
 
 ```bash
 dsh plugin --profile web add github:Jiao-XXX/dsh-auto-approve

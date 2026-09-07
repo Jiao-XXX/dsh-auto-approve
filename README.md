@@ -11,6 +11,7 @@
 <p align="center">
   <a href="https://github.com/Jiao-XXX/dsh-auto-approve/actions/workflows/test.yml"><img src="https://github.com/Jiao-XXX/dsh-auto-approve/actions/workflows/test.yml/badge.svg" alt="test status"></a>
   <a href="./LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="license: MIT"></a>
+  <a href="https://dsh.directory/plugins/jiao-xxx/dsh-auto-approve"><img src="https://dsh.directory/badges/listed.svg" alt="Listed on DSH Directory"></a>
 </p>
 
 中文 | [English](README_EN.md)
@@ -64,7 +65,15 @@ DeepSeek Harness 需要运行在受支持的 Node.js 版本上。宿主侧插件
 
 本包**不携带任何运行时依赖**：`@deepseek-ai/schemastery` 声明为 `peerDependency`，由 dsh 运行时供给。这遵循 Cordis 的组件依赖语义——组件不内捆依赖，而是期待运行时上下文提供——从机制上杜绝插件自带副本与 profile 版本漂移后出现两份 Schema 实例的问题。
 
-从 GitHub 安装：
+从 npm 安装（推荐）：
+
+```bash
+dsh plugin --profile web add dsh-auto-approve
+```
+
+npm 上的版本经过发布前的完整测试，也是 [DSH Directory](https://dsh.directory/plugins/jiao-xxx/dsh-auto-approve) 收录的形式。
+
+从 GitHub 安装（获取尚未发布的改动）：
 
 ```bash
 dsh plugin --profile web add github:Jiao-XXX/dsh-auto-approve
