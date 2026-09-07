@@ -321,10 +321,13 @@ test('discovers an opened permission menu while Workspace Write is current', () 
 
 test('rejects lookalike menus and removes stale marks and owned CSS on dispose', () => {
   const document = new FakeDocument()
+  // A genuine lookalike: an unrelated menu that happens to carry an "Auto"
+  // entry but none of the built-in preset labels. A menu holding Auto plus
+  // built-ins is a real permission menu even when a preset is absent.
   const invalid = permissionControl(
     document,
     'Access mode, current: Auto',
-    ['Read Only', 'Workspace Write', 'Auto'],
+    ['Rename', 'Duplicate', 'Auto'],
   )
   const app = browserHarness({ document })
   app.apply()
@@ -369,4 +372,22 @@ test('missing browser APIs and selector failures are cosmetic and never fail app
   assert.doesNotThrow(() => {
     brokenEffect.plugin.apply({ effect() { throw new Error('effect failed') } })
   })
+})
+
+test('recognizes the permission menu when built-in labels are localized', () => {
+  const document = new FakeDocument()
+  // dsh 0.1.2 renders built-in presets through locale product labels; a
+  // host-configured preset such as Auto keeps its own name.
+  const localized = permissionControl(
+    document,
+    '访问模式，当前：Auto',
+    ['仅可查看', '工作区内修改', 'Auto', '完全权限'],
+  )
+  const app = browserHarness({ document })
+  app.apply()
+  app.flushFrames()
+
+  assert.equal(localized.trigger.getAttribute(ICON_ATTRIBUTE), 'trigger')
+  assert.equal(localized.items.get('Auto').getAttribute(ICON_ATTRIBUTE), 'menu')
+  app.dispose()
 })

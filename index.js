@@ -143,6 +143,29 @@ export function parseClassifierVerdict(text) {
     : undefined
 }
 
+/**
+ * Read a session's events across two host generations. dsh 0.1.2 replaced the
+ * `events` getter with `snapshotEvents()`; both return the same frozen snapshot.
+ */
+function sessionEvents(session) {
+  return typeof session?.snapshotEvents === 'function'
+    ? session.snapshotEvents()
+    : session?.events
+}
+
+/**
+ * Resolve the session's effective preset across two host generations. dsh 0.1.2
+ * changed `current(events)` to `current(session)`, reading a session projection
+ * instead of folding the raw log; `permissionState` marks the newer service.
+ */
+function currentPreset(ctx, session, events) {
+  const presets = ctx.get('permissionPresets')
+  if (presets === undefined) return undefined
+  return typeof presets.permissionState === 'function'
+    ? presets.current(session)
+    : presets.current(events)
+}
+
 function findToolArguments(events, callId) {
   if (callId === undefined) return undefined
   for (let index = events.length - 1; index >= 0; index -= 1) {
@@ -498,8 +521,8 @@ export function createApprovalHandler(ctx, config, patterns, lifecycle = {}) {
       }
 
       const session = req.agent.session
-      const events = session.events
-      if (ctx.get('permissionPresets')?.current(events) !== config.presetName) {
+      const events = sessionEvents(session)
+      if (currentPreset(ctx, session, events) !== config.presetName) {
         return delegate()
       }
       autoPreset = true

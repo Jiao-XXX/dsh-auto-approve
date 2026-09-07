@@ -247,7 +247,16 @@ dsh 的沙箱升级没有路径粒度：模型能申请的目标只有 `danger-f
 
 ## 已知限制
 
-DeepSeek Harness rc.6 的 Permissions 选择器尚未提供自定义预设图标 API。本插件因此通过浏览器侧的 best-effort 兼容层识别默认 `Auto` 触发器和菜单项，再补上图标。该兼容层依赖 rc.6 的 DOM 结构和无障碍文案；dsh 升级或权限预设被重命名后，图标可能再次消失。这种失效只影响图标显示，不影响 `Auto` 审批、危险规则或人工兜底。
+DeepSeek Harness 的 Permissions 选择器尚未提供自定义预设图标 API。本插件因此通过浏览器侧的 best-effort 兼容层识别 `Auto` 触发器和菜单项，再补上图标。该兼容层依赖宿主的 DOM 结构与无障碍文案：菜单需同时出现 `Auto` 与至少两个内置档位标签（英文 `Read Only` / `Workspace Write` / `Full access`，或 0.1.2 起的中文「仅可查看」「工作区内修改」「完全权限」）。dsh 再次改动这些文案或结构后，图标可能消失——这种失效只影响图标显示，不影响 `Auto` 审批、危险规则或人工兜底。
+
+### 宿主版本兼容
+
+插件同时兼容 dsh 0.1.2 之前与之后的会话接口，按运行时特性探测选择调用方式，无需按 dsh 版本安装不同版本：
+
+| 接口 | 0.1.2 之前 | 0.1.2 起 |
+| --- | --- | --- |
+| 读会话事件 | `session.events` | `session.snapshotEvents()` |
+| 解析当前权限档 | `permissionPresets.current(events)` | `permissionPresets.current(session)` |
 
 本 bundle 为插入 `auto` 会整体重述权限预设表，而不是增量追加。未来 `dsh-base` 若新增、重命名或调整权限档，已安装版本不会自动继承这些变化；升级 dsh 时应重新核对并更新 patch，具体步骤见[验收文档](./docs/ACCEPTANCE.md)。
 

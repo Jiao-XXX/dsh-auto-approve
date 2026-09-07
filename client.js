@@ -10,12 +10,18 @@ window.__ModuleLoader__.load({
       '访问模式，当前：Auto',
       'Access mode, current: Auto',
     ])
-    const PERMISSION_LABELS = new Set([
+    // Built-in preset labels are localized from dsh 0.1.2 on, so the menu is
+    // recognized by the Auto entry plus at least two other known built-ins
+    // rather than by one exact set of English labels.
+    const BUILT_IN_LABELS = new Set([
       'Read Only',
       'Workspace Write',
-      'Auto',
       'Full access',
+      '仅可查看',
+      '工作区内修改',
+      '完全权限',
     ])
+    const MIN_BUILT_IN_LABELS = 2
     const TRIGGER_PREFIXES = [
       '访问模式，当前：',
       'Access mode, current: ',
@@ -127,10 +133,13 @@ window.__ModuleLoader__.load({
           if (typeof label !== 'string' || label.length === 0 || byLabel.has(label)) continue
           byLabel.set(label, item)
         }
-        for (const label of PERMISSION_LABELS) {
-          if (!byLabel.has(label)) return undefined
+        const autoItem = byLabel.get('Auto')
+        if (autoItem === undefined) return undefined
+        let builtIns = 0
+        for (const label of byLabel.keys()) {
+          if (BUILT_IN_LABELS.has(label)) builtIns += 1
         }
-        return byLabel.get('Auto')
+        return builtIns >= MIN_BUILT_IN_LABELS ? autoItem : undefined
       } catch {
         return undefined
       }

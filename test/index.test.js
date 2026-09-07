@@ -59,6 +59,7 @@ function harness({
   config = {},
   stream = () => textResponse('{"verdict":"approve"}'),
   current = () => preset,
+  permissionState,
   loggerInfo,
   llmAvailable = true,
   defaultModelAvailable = true,
@@ -91,7 +92,9 @@ function harness({
   }
   const ctx = {
     get(service) {
-      if (service === 'permissionPresets') return { current }
+      if (service === 'permissionPresets') {
+        return permissionState === undefined ? { current } : { current, permissionState }
+      }
       if (service === 'llm') return llmAvailable ? llm : undefined
       if (service === 'agentDefaultModel') {
         if (!defaultModelAvailable) return undefined
@@ -1200,4 +1203,50 @@ test('a missing tool call leaves memory untouched', async () => {
   assert.deepEqual(await app.run(noCall), { result: 'allowed-once', nextCalls: 0 })
   assert.deepEqual(await app.run(noCall), { result: 'allowed-once', nextCalls: 0 })
   assert.equal(app.llmCalls, 2)
+})
+
+test('reads events and the preset through the dsh 0.1.2 session API', async () => {
+  // 0.1.2 replaced session.events with snapshotEvents() and changed
+  // permissionPresets.current(events) to current(session); permissionState
+  // marks the newer service.
+  const legacy = requestOf()
+  const events = legacy.agent.session.events
+  let currentArg
+  let snapshotCalls = 0
+  const session = {
+    id: legacy.agent.session.id,
+    header: legacy.agent.session.header,
+    snapshotEvents() {
+      snapshotCalls += 1
+      return Object.freeze([...events])
+    },
+  }
+  const request = { ...legacy, agent: { session } }
+  const app = harness({
+    current: (arg) => {
+      currentArg = arg
+      return 'auto'
+    },
+    permissionState: () => ({}),
+  })
+
+  assert.deepEqual(await app.run(request), { result: 'allowed-once', nextCalls: 0 })
+  assert.equal(currentArg, session, 'the new service receives the session, not its events')
+  assert.ok(snapshotCalls > 0, 'events come from snapshotEvents()')
+  const evidence = JSON.parse(app.lastLlmOptions.messages[0].content[0].text)
+  assert.equal(evidence.command, 'npm install left-pad')
+  assert.equal(evidence.workspacePath, '/workspace/project')
+})
+
+test('still reads the pre-0.1.2 session API when the newer service is absent', async () => {
+  let currentArg
+  const app = harness({
+    current: (arg) => {
+      currentArg = arg
+      return 'auto'
+    },
+  })
+  const request = requestOf()
+  assert.deepEqual(await app.run(request), { result: 'allowed-once', nextCalls: 0 })
+  assert.equal(currentArg, request.agent.session.events, 'the older service receives the events array')
 })

@@ -248,7 +248,16 @@ Use `workspace-write` when every escalation must receive human review. Add deplo
 
 ## Known limitations
 
-The Permissions selector in DeepSeek Harness rc.6 does not expose an API for custom preset icons. The plugin therefore uses a best-effort browser compatibility layer to recognize the default `Auto` trigger and menu item and add the icon. This layer depends on rc.6's DOM structure and accessible copy, so a dsh upgrade or renamed permission presets may make the icon disappear again. Such a failure is cosmetic only: it does not affect `Auto` approvals, danger rules, or the human fallback.
+The Permissions selector in DeepSeek Harness does not expose an API for custom preset icons. The plugin therefore uses a best-effort browser compatibility layer to recognize the `Auto` trigger and menu item and add the icon. The layer depends on the host's DOM structure and accessible copy: the menu must show `Auto` alongside at least two built-in preset labels (English `Read Only` / `Workspace Write` / `Full access`, or the Chinese labels shipped from 0.1.2 on). If dsh changes that copy or structure again the icon may disappear — a cosmetic failure only, with no effect on `Auto` approvals, danger rules, or the human fallback.
+
+### Host version compatibility
+
+The plugin supports the session APIs from both before and after dsh 0.1.2, selecting the call form by runtime feature detection, so one plugin version fits every host:
+
+| Interface | Before 0.1.2 | From 0.1.2 |
+| --- | --- | --- |
+| Reading session events | `session.events` | `session.snapshotEvents()` |
+| Resolving the current preset | `permissionPresets.current(events)` | `permissionPresets.current(session)` |
 
 To insert `auto`, this bundle restates the complete permission preset table rather than appending one entry. If a future `dsh-base` release adds, renames, or changes presets, an installed release will not inherit those changes automatically. Recheck and update the patch whenever dsh is upgraded; see the [acceptance guide](./docs/ACCEPTANCE.md).
 
