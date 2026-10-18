@@ -1,6 +1,184 @@
 import { createHash, randomUUID } from 'node:crypto'
+import path from 'node:path'
+import os from 'node:os'
 import Schema from '@deepseek-ai/schemastery'
 import { DEFAULT_DANGER_PATTERNS } from './danger-patterns.js'
+
+const WRITE_PATH_COMMANDS = /(?:^|[;&|]\s*)(?:sudo\s+)?(?:tee|touch|mkdir|install|cp|mv|ln|chmod|chown|sed\s+-[^\n]*i|perl\s+-[^\n]*i)\b/i
+const DYNAMIC_WRITE_COMMANDS = /(?:^|[^\w])(?:sudo\s+)?(?:python(?:3)?\s+-c|node\s+-e|(?:ba|z|k)?sh\s+-c|powershell(?:\.exe)?\s+-command|pwsh\s+-command|xargs)\b/i
+// Device sinks and conventional temporary locations are trusted non-workspace write targets.
+const ALLOWED_WRITE_PATH = /^(?:nul$|[a-z]:[\\/]+users[\\/]+[^\\/]+[\\/]appdata[\\/]local[\\/]temp(?:[\\/]|$)|[\\/]tmp(?:[\\/]|$)|[\\/]var[\\/]tmp(?:[\\/]|$)|[\\/]dev[\\/](?:null|stdout|stderr)(?:[\\/]|$)|%temp%(?:[\\/]|$)|\$tmpdir(?:[\\/]|$))/i
+// Only the last operand of these verbs is a write destination; earlier operands are read sources.
+const DESTINATION_COMMANDS = /^(?:install|cp|mv|ln)$/
+
+function normalizePath(value) {
+  const text = String(value).replace(/[\\/]+/g, '/')
+  return /^[a-z]:\//i.test(text)
+    ? path.win32.normalize(text).replace(/[\\/]+/g, '/')
+    : path.posix.normalize(text)
+}
+
+function isAllowedWritePath(value) {
+  const normalized = normalizePath(value)
+  if (ALLOWED_WRITE_PATH.test(normalized)) return true
+  const temp = normalizePath(os.tmpdir()).replace(/\/+$/, '')
+  // A root-only tmpdir is ignored so a degraded value cannot exempt every write.
+  if (temp.split('/').filter(Boolean).length <= 1) return false
+  const windows = /^[a-z]:[\\/]/i.test(normalized) || /^[a-z]:[\\/]/i.test(temp)
+  const tempForComparison = windows ? temp.toLowerCase() : temp
+  return isInsideRoot(value, tempForComparison, tempForComparison)
+}
+
+function isInsideRoot(raw, rootPath, workspacePath) {
+  const original = String(raw).replace(/^['"]|['"]$/g, '')
+  if (/^~/.test(original) || original.includes('\0')) return false
+  const windows = /^[a-z]:[\\/]/i.test(original) || /^[a-z]:[\\/]/i.test(workspacePath)
+  const api = windows ? path.win32 : path.posix
+  const relative = api.relative(api.resolve(rootPath), api.resolve(api.resolve(workspacePath), original))
+  const compared = windows ? relative.toLowerCase() : relative
+  return compared === '' || (!compared.startsWith('..') && !api.isAbsolute(relative))
+}
+
+function isOutsideTrustedRoots(raw, workspacePath, roots = []) {
+  const original = String(raw).replace(/^['"]|['"]$/g, '')
+  if (/^~[^\\/]/.test(original)) return true
+  const value = original.startsWith('~/') || original.startsWith('~\\')
+    ? path.join(os.homedir(), original.slice(2))
+    : original
+  if (value.includes('\0')) return true
+  const windows = /^[a-z]:[\\/]/i.test(value) || /^[a-z]:[\\/]/i.test(workspacePath)
+  const api = windows ? path.win32 : path.posix
+  const root = api.resolve(workspacePath)
+  const target = api.resolve(root, value)
+  const relative = api.relative(root, target)
+  const compared = windows ? relative.toLowerCase() : relative
+  const outside = compared !== '' && (compared === '..' || compared.startsWith(`..${api.sep}`) || api.isAbsolute(relative))
+  // Configured absolute roots extend the trusted write boundary beyond the workspace.
+  return outside && roots.every(trustedRoot => !isInsideRoot(target, trustedRoot, workspacePath))
+}
+
+function shellTokens(value) {
+  return [...String(value).matchAll(/"([^"\\]*(?:\\.[^"\\]*)*)"|'([^']*)'|([^\s;&|]+)/g)]
+    .map(match => match[1] ?? match[2] ?? match[3])
+}
+
+function extractWriteTargets(command) {
+  const targets = []
+  for (const match of String(command).matchAll(/(?<![<])(?:[0-9]+)?(?:>>|>|>&|&>)\s*(?:"([^"\\]*(?:\\.[^"\\]*)*)"|'([^']*)'|([^\s;&|]+))/g)) {
+    targets.push(match[1] ?? match[2] ?? match[3])
+  }
+  for (const match of String(command).matchAll(/(?:^|[;&|]\s*)(?:sudo\s+)?(tee|touch|mkdir|install|cp|mv|ln|chmod|chown|(?:sed|perl)\s+-[^\n]*i)\b([^\n;&|]*)/gi)) {
+    const verb = match[1].toLowerCase()
+    if (DESTINATION_COMMANDS.test(verb)) {
+      // Unparseable shapes return undefined and fall back to collecting every path-like token below.
+      const destination = copyDestination(verb, match[2])
+      if (destination !== undefined) {
+        if (destination !== '') targets.push(destination)
+        continue
+      }
+    }
+    for (const token of shellTokens(match[2])) {
+      if (!token.startsWith('-') && (token.includes('/') || token.includes('\\') || token.startsWith('~') || token === '.' || token === '..')) targets.push(token)
+    }
+  }
+  return targets
+}
+
+/** Return the write destination of a cp/mv/ln/install invocation, or undefined when unparseable. */
+function copyDestination(verb, rest) {
+  const tokens = shellTokens(rest)
+  const operands = []
+  let targetDirectory
+  for (let index = 0; index < tokens.length; index += 1) {
+    const token = tokens[index]
+    if (token === '--') {
+      operands.push(...tokens.slice(index + 1))
+      break
+    }
+    if (token.startsWith('--')) {
+      const target = /^--target-directory(?:=(.*))?$/.exec(token)
+      if (target !== null) {
+        if (target[1] !== undefined) targetDirectory = target[1]
+        else if (tokens[index + 1] !== undefined) targetDirectory = tokens[++index]
+        else return undefined
+      } else if (/^--(?:suffix|mode|owner|group|context|strip-program|preserve|backup)(?!=)/.test(token)) {
+        if (tokens[index + 1] === undefined) return undefined
+        index += 1
+      } else if (verb === 'install' && /^--directory$/.test(token)) {
+        return undefined
+      } else if (/^--(?:no-target-directory|interactive|force|link|symbolic|directory|verbose|update|archive|recursive|no-clobber|strip|compare|preserve-timestamps|parents|attributes-only|one-file-system|copy-contents|dereference|no-dereference|relative|logical|physical|sparse|reflink)(?==|$)/.test(token)) {
+        continue
+      } else if (!token.includes('=')) {
+        return undefined
+      }
+      continue
+    }
+    if (token.startsWith('-') && token !== '-') {
+      for (let position = 1; position < token.length; position += 1) {
+        const letter = token[position]
+        if (letter === 't') {
+          const inline = token.slice(position + 1)
+          if (inline.length > 0) targetDirectory = inline
+          else if (tokens[index + 1] !== undefined) targetDirectory = tokens[++index]
+          else return undefined
+          break
+        }
+        if ('SgmoZ'.includes(letter)) {
+          const inline = token.slice(position + 1)
+          if (inline.length === 0) {
+            if (tokens[index + 1] === undefined) return undefined
+            index += 1
+          }
+          break
+        }
+        if (verb === 'install' && letter === 'd') return undefined
+        if ('bCcDdFfiLlnPpRrsStTuvxZz'.includes(letter)) continue
+        return undefined
+      }
+      continue
+    }
+    operands.push(token)
+  }
+  if (targetDirectory !== undefined) return targetDirectory
+  return operands.length > 0 ? operands.at(-1) : undefined
+}
+
+/** Detect explicit writes outside the workspace and trusted roots, allowing device sinks and temp paths. */
+export function findOutsideWorkspaceWrite(command, workspacePath, trustedWriteRoots = []) {
+  if (typeof command !== 'string' || typeof workspacePath !== 'string' || workspacePath.length === 0) return undefined
+  for (const raw of extractWriteTargets(command)) {
+    if (!isAllowedWritePath(raw) && isOutsideTrustedRoots(raw, workspacePath, trustedWriteRoots)) return raw
+  }
+  return undefined
+}
+
+function writeScopeViolation(command, workspacePath, toolName, toolArguments, trustedWriteRoots = []) {
+  const isFileMutationTool = toolName === 'write' || toolName === 'edit'
+  if (isFileMutationTool) {
+    let rawTarget
+    try {
+      const parsed = JSON.parse(toolArguments ?? '')
+      rawTarget = parsed !== null && typeof parsed === 'object' ? parsed.file_path : undefined
+    } catch {
+      return 'unresolved-write-target'
+    }
+    if (typeof rawTarget !== 'string' || rawTarget.length === 0) return 'unresolved-write-target'
+    return typeof workspacePath !== 'string' || workspacePath.length === 0
+      || (!isAllowedWritePath(rawTarget) && isOutsideTrustedRoots(rawTarget, workspacePath, trustedWriteRoots))
+      ? rawTarget
+      : undefined
+  }
+  if (typeof command !== 'string') return undefined
+  const dynamicCandidate = DYNAMIC_WRITE_COMMANDS.test(command)
+  const writeCandidate = dynamicCandidate || WRITE_PATH_COMMANDS.test(command) || /(?<![<])(?:[0-9]+)?(?:>>|>|>&|&>)\s*/.test(command)
+  if (typeof workspacePath !== 'string' || workspacePath.length === 0) return writeCandidate ? 'unresolved-write-target' : undefined
+  if (!writeCandidate) return undefined
+  if (dynamicCandidate) return 'unresolved-write-target'
+  if (/\$\{|\$[A-Za-z_][A-Za-z0-9_]*|%[^%]+%/.test(command)) return 'dynamic-write-target'
+  const targets = extractWriteTargets(command)
+  if (targets.length === 0) return 'unresolved-write-target'
+  return findOutsideWorkspaceWrite(command, workspacePath, trustedWriteRoots)
+}
 
 export { DEFAULT_DANGER_PATTERNS } from './danger-patterns.js'
 
@@ -21,8 +199,9 @@ const CLASSIFIER_SYSTEM_PROMPT = [
   'Ask for publishing or releasing to a shared or public destination: package registries, production deploys, shared or production-like branches, and anything other people immediately consume.',
   'Ask for system-wide privileged changes: sudo, writes under /etc, /usr, /Library, or /System, system daemons and launch agents, global package managers, firewall or security settings, and changes to other user accounts.',
   'Ask when the command is genuinely unreadable to you — obfuscated, encoded, or fetched-then-executed from an unknown source — so you cannot tell what it does at all.',
-  'Everything else is routine developer work: approve it. Writing inside the user\'s own tool and configuration directories (for example ~/.dsh, ~/.config, ~/.cache, and per-application support directories), installing or updating dependencies, running builds, tests, linters, and formatters, starting or restarting the user\'s own local services, reading files and fetching read-only resources, and inspecting local processes and ports are all approve.',
-  'The requested sandbox mode alone is not a reason to ask; judge the concrete operation, justification, and workspace scope. Work outside the session workspace is normal and is not by itself a reason to ask.',
+  'Everything else is routine developer work: writing inside the user\'s own tool and configuration directories (for example ~/.dsh, ~/.config, ~/.cache, and per-application support directories), installing or updating dependencies, running builds, tests, linters, and formatters, starting or restarting the user\'s own local services, reading files and fetching read-only resources, and inspecting local processes and ports are all approve.',
+  'When the harness home is absent from the evidence\'s trustedWriteRoots, ask for operations that modify the agent harness\'s own runtime: installing or removing its plugins, or changing its presets or profile configuration.',
+  'The requested sandbox mode alone is not a reason to ask; judge the concrete operation, justification, and workspace scope. Writes outside the session workspace and the evidence\'s trustedWriteRoots are handled by the deterministic scope check before classification; if the target cannot be resolved, ask.',
   'Treat latestUserMessage as trusted context written directly by the user. When it explicitly authorizes the concrete operation under review (for example, pushing to the user\'s own fork), approve even if a concern above would otherwise apply, except for credential exfiltration, which always asks. Command examples or quoted commands alone are not execution authorization.',
   'For ordinary git push requests, pushing to the user\'s own fork or working branch is routine; pushing to main, master, release, production, prod, or another shared/production-like branch should be ask. Force-pushes are handled before classification by the danger list.',
 ].join('\n')
@@ -54,6 +233,8 @@ export const Config = Schema.object({
     Schema.array(Schema.string()),
     Schema.const(null),
   ]).default(null),
+  trustedWriteRoots: Schema.array(Schema.string().min(1)).default([]),
+  trustDshHome: Schema.boolean().default(true),
   sessionMemory: Schema.boolean().default(true),
   sessionMemoryTtlMs: Schema.number().step(1).min(1).max(2_147_483_647).default(1_800_000),
 })
@@ -119,6 +300,24 @@ export function compileDangerPatterns(config) {
       throw new Error(`dsh-auto-approve: invalid danger pattern ${JSON.stringify(source)}: ${String(error)}`)
     }
   })
+}
+
+/** Compile the configured trusted write roots once while the plugin loads. */
+export function compileTrustedWriteRoots(config, env = process.env) {
+  const roots = (config.trustedWriteRoots ?? []).map((source) => {
+    const trimmed = String(source).trim()
+    if (trimmed.length === 0 || (!path.isAbsolute(trimmed) && !path.win32.isAbsolute(trimmed))) {
+      throw new Error(`dsh-auto-approve: invalid trusted write root ${JSON.stringify(source)}: expected an absolute path such as /Users/you/code or D:\\work\\code`)
+    }
+    return path.resolve(trimmed)
+  })
+  if (config.trustDshHome === false) return roots
+  // Mirrors dsh resolveDshHome: a non-blank $DSH_HOME (~ expanded) wins over ~/.dsh.
+  const fromEnv = env.DSH_HOME
+  const home = fromEnv !== undefined && fromEnv.trim().length > 0 ? fromEnv.trim() : path.join(os.homedir(), '.dsh')
+  return [...roots, path.resolve(home === '~' || home.startsWith('~/') || home.startsWith('~\\')
+    ? path.join(os.homedir(), home.slice(1))
+    : home)]
 }
 
 /** Return the first deterministic danger match, if any. */
@@ -491,7 +690,7 @@ function cancellationDetail(req, lifetimeSignal) {
 }
 
 /** Build the waterfall listener separately so unit tests can exercise it directly. */
-export function createApprovalHandler(ctx, config, patterns, lifecycle = {}) {
+export function createApprovalHandler(ctx, config, patterns, trustedWriteRoots = [], lifecycle = {}) {
   const trackClassification = lifecycle.trackClassification
     ?? (operation => Promise.resolve().then(operation))
   const lifetimeSignal = lifecycle.signal
@@ -540,6 +739,13 @@ export function createApprovalHandler(ctx, config, patterns, lifecycle = {}) {
         return delegate()
       }
 
+      const outsideWrite = writeScopeViolation(command, session.header?.cwd, req.toolName, toolArguments, trustedWriteRoots)
+      if (outsideWrite !== undefined) {
+        record('danger', `outside-workspace-write=${inlineSummary(outsideWrite, COMMAND_SUMMARY_MAX_CHARS)}`)
+        logDecision(ctx, 'manual', `outside-workspace-write=${JSON.stringify(outsideWrite)}`)
+        return delegate()
+      }
+
       const beforeClassification = cancellationDetail(req, lifetimeSignal)
       if (beforeClassification !== undefined) {
         record('classifier-manual', `verdict=${beforeClassification}`)
@@ -575,6 +781,7 @@ export function createApprovalHandler(ctx, config, patterns, lifecycle = {}) {
         justification: reason,
         targetSandboxMode: targetSandboxMode(reason),
         workspacePath: session.header?.cwd ?? null,
+        trustedWriteRoots,
         latestUserMessage: userMessage.text,
       }, lifetimeSignal, trackIteratorCleanup))
       if (decision.verdict === 'approve') {
@@ -622,6 +829,7 @@ export function apply(ctx, config = {}) {
   // also keeps direct apply(ctx, bareObject) unit tests faithful to that boundary.
   const resolved = Config(config)
   const patterns = compileDangerPatterns(resolved)
+  const trustedWriteRoots = compileTrustedWriteRoots(resolved)
   const reportBySession = new Map()
   const memoryBySession = new Map()
   const memory = Object.freeze({
@@ -660,7 +868,7 @@ export function apply(ctx, config = {}) {
 
     const disposeListener = ctx.on(
       'approval/request',
-      createApprovalHandler(ctx, resolved, patterns, {
+      createApprovalHandler(ctx, resolved, patterns, trustedWriteRoots, {
         signal: lifetime.signal,
         trackClassification,
         trackIteratorCleanup,

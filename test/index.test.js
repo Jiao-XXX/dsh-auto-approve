@@ -1,11 +1,15 @@
 import assert from 'node:assert/strict'
+import os from 'node:os'
+import path from 'node:path'
 import test from 'node:test'
 import {
   Config,
   DEFAULT_DANGER_PATTERNS,
   apply,
   compileDangerPatterns,
+  compileTrustedWriteRoots,
   findDangerMatch,
+  findOutsideWorkspaceWrite,
   parseClassifierVerdict,
 } from '../index.js'
 
@@ -29,25 +33,28 @@ function requestOf({
   callId = 'call-1',
   sessionId = 'session-1',
   signal,
+  toolName = 'bash',
+  toolArguments,
+  cwd = '/workspace/project',
 } = {}) {
   return {
     agent: {
       session: {
         id: sessionId,
-        header: { cwd: '/workspace/project' },
+        header: { cwd },
         events: events ?? [{
           type: 'tool/call',
           data: {
             turn: 1,
             step: 1,
             callId,
-            name: 'bash',
-            arguments: JSON.stringify({ command }),
+            name: toolName,
+            arguments: toolArguments ?? JSON.stringify(toolName === 'bash' ? { command } : { file_path: command }),
           },
         }],
       },
     },
-    toolName: 'bash',
+    toolName,
     callId,
     reason,
     ...signal === undefined ? {} : { signal },
@@ -365,6 +372,268 @@ test('missing tool arguments still classify from the remaining evidence', async 
   assert.equal(evidence.justification, request.reason)
 })
 
+test('write scope detection handles normalized paths and no-space redirections', () => {
+  for (const command of ['echo x > ../other/file', 'echo x>/etc/x', 'printf x>>/etc/x', 'touch /etc/x', 'mkdir -p /etc/x']) {
+    assert.notEqual(findOutsideWorkspaceWrite(command, '/workspace/project'), undefined, command)
+  }
+  assert.equal(findOutsideWorkspaceWrite('echo x > /workspace/project/src/../out', '/workspace/project'), undefined)
+  assert.notEqual(findOutsideWorkspaceWrite('echo x > /workspace/Project/out', '/workspace/project'), undefined)
+  assert.equal(findOutsideWorkspaceWrite('cat < /etc/x', '/workspace/project'), undefined)
+  assert.equal(findOutsideWorkspaceWrite('cat <<EOF', '/workspace/project'), undefined)
+  assert.notEqual(findOutsideWorkspaceWrite('echo x > ~/outside-file', '/workspace/project'), undefined)
+  assert.notEqual(findOutsideWorkspaceWrite('echo x > ~other-user/outside-file', '/workspace/project'), undefined)
+  assert.equal(findOutsideWorkspaceWrite('echo x > /tmp/out', '/workspace/project'), undefined)
+})
+
+test('write scope detection distinguishes Windows workspace siblings and temporary paths', () => {
+  const workspace = 'C:\\work\\project'
+  assert.equal(findOutsideWorkspaceWrite('echo x > C:\\work\\project\\src\\..\\out.txt', workspace), undefined)
+  assert.notEqual(findOutsideWorkspaceWrite('echo x > C:\\work\\project-other\\out.txt', workspace), undefined)
+  assert.equal(findOutsideWorkspaceWrite('echo x > C:\\Users\\tester\\AppData\\Local\\Temp\\out.txt', workspace), undefined)
+  assert.equal(findOutsideWorkspaceWrite('echo x > NUL', workspace), undefined)
+  assert.equal(findOutsideWorkspaceWrite('echo x > C:\\work\\project\\NUL', workspace), undefined)
+})
+
+test('device sinks are exempt write targets on every platform spelling', () => {
+  for (const command of [
+    'npm test > /dev/null 2>&1',
+    'make build 2>/dev/null',
+    'echo x > /dev/null',
+    'echo x > /dev/stdout',
+    'echo x > /dev/stderr',
+    'echo x > nul',
+  ]) {
+    assert.equal(findOutsideWorkspaceWrite(command, '/Users/me/project'), undefined, command)
+  }
+  assert.notEqual(findOutsideWorkspaceWrite('echo x > /dev/nulls', '/Users/me/project'), undefined)
+  assert.notEqual(findOutsideWorkspaceWrite('echo x > /dev', '/Users/me/project'), undefined)
+  assert.notEqual(findOutsideWorkspaceWrite('echo x > /dev/null/..', '/Users/me/project'), undefined)
+})
+
+test('the platform temporary directory is an exempt write target', () => {
+  const temp = os.tmpdir()
+  assert.equal(findOutsideWorkspaceWrite(`echo x > ${temp}${path.sep}out.log`, '/Users/me/project'), undefined)
+  assert.equal(findOutsideWorkspaceWrite(`echo x > ${temp}${path.sep}a${path.sep}b.log`, '/Users/me/project'), undefined)
+  assert.notEqual(findOutsideWorkspaceWrite('echo x > /var/folders/zz/out.log', '/Users/me/project'), undefined)
+})
+
+test('copy-like commands treat only the destination operand as a write target', () => {
+  for (const [command, expected] of [
+    ['cp ~/.gitconfig ./backup.txt', undefined],
+    ['ln -s /usr/local/bin/node ./node', undefined],
+    ['mv ~/secret.txt ./in.txt', undefined],
+    ['install ./a.sh ./b.sh', undefined],
+    ['cp a b', undefined],
+    ['cp ./a.txt /etc/bak', '/etc/bak'],
+    ['mv ./source ../outside', '../outside'],
+    ['cp a b /etc/dir/', '/etc/dir/'],
+    ['cp -t /etc ./a.txt', '/etc'],
+    ['cp --target-directory=/etc a', '/etc'],
+    ['cp --target-directory /etc a', '/etc'],
+    ['cp -rt /etc a b', '/etc'],
+    ['install -m 755 ./a.sh /usr/local/bin/a.sh', '/usr/local/bin/a.sh'],
+    ['cp -S .bak src dst', undefined],
+    ['cp --suffix .bak src dst', undefined],
+    ['cp -q ~/.gitconfig ./b', '~/.gitconfig'],
+    ['cp -Zcontext src /etc/dst', '/etc/dst'],
+  ]) {
+    assert.equal(findOutsideWorkspaceWrite(command, '/Users/me/project'), expected, command)
+  }
+})
+
+test('install directory mode and unparseable shapes fall back to collecting every path operand', () => {
+  for (const command of [
+    'install -d /a /b',
+    'install --directory /a /b',
+    'cp -Q /a /b',
+    'cp --unknown-flag /a /b',
+  ]) {
+    assert.notEqual(findOutsideWorkspaceWrite(command, '/Users/me/project'), undefined, command)
+  }
+})
+
+test('copy commands with a truncated flag value fail closed before classification', async () => {
+  for (const command of ['cp -S', 'cp --target-directory']) {
+    const app = harness()
+    assert.deepEqual(await app.run(requestOf({ command })), { result: MANUAL, nextCalls: 1 }, command)
+    assert.equal(app.llmCalls, 0, command)
+    assert.match(app.logs[0], /unresolved-write-target/, command)
+  }
+})
+
+test('harness configuration directories stay trusted by default and can be untrusted', async () => {
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = path.join(os.homedir(), '.dsh')
+  try {
+    let sessionCounter = 0
+    for (const filePath of ['~/.dsh/profiles/default.yml', '~/.dsh/.agent-presets/auto.yml']) {
+      const sessionId = `session-dsh-home-${sessionCounter++}`
+      const request = requestOf({ toolName: 'write', command: filePath, sessionId })
+      const app = harness({ config: { sessionMemory: false } })
+      assert.deepEqual(await app.run(request), { result: 'allowed-once', nextCalls: 0 }, filePath)
+      assert.equal(app.llmCalls, 1, filePath)
+      const strictSessionId = `session-dsh-home-strict-${sessionCounter++}`
+      const strict = harness({ config: { trustDshHome: false, sessionMemory: false } })
+      assert.deepEqual(await strict.run(requestOf({ toolName: 'write', command: filePath, sessionId: strictSessionId })), { result: MANUAL, nextCalls: 1 }, filePath)
+      assert.equal(strict.llmCalls, 0, filePath)
+      assert.match(strict.logs[0], /outside-workspace-write/, filePath)
+    }
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+  }
+})
+
+test('a custom $DSH_HOME is the trusted root instead of ~/.dsh', async () => {
+  const previous = process.env.DSH_HOME
+  const custom = path.join(os.homedir(), 'dsh-auto-approve-custom-home')
+  process.env.DSH_HOME = custom
+  try {
+    const app = harness({ config: { sessionMemory: false } })
+    assert.deepEqual(
+      await app.run(requestOf({ toolName: 'write', command: path.join(custom, 'profiles', 'default.yml'), sessionId: 'session-custom-dsh-1' })),
+      { result: 'allowed-once', nextCalls: 0 },
+    )
+    assert.equal(app.llmCalls, 1)
+    const tilde = harness({ config: { sessionMemory: false } })
+    assert.deepEqual(
+      await tilde.run(requestOf({ toolName: 'write', command: '~/.dsh/profiles/default.yml', sessionId: 'session-custom-dsh-2' })),
+      { result: MANUAL, nextCalls: 1 },
+    )
+    assert.equal(tilde.llmCalls, 0)
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+  }
+})
+
+test('configured trusted write roots extend the boundary for tools and commands', async () => {
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = path.join(os.homedir(), 'dsh-auto-approve-unrelated-home')
+  const root = path.join(os.homedir(), 'dsh-auto-approve-trusted-root')
+  const target = path.join(root, 'out.txt')
+  try {
+    let sessionCounter = 0
+    for (const [toolName, command] of [['write', target], ['bash', `cp ./a.txt "${target}"`]]) {
+      const app = harness({ config: { trustedWriteRoots: [root], sessionMemory: false } })
+      assert.deepEqual(await app.run(requestOf({ toolName, command, sessionId: `session-trusted-${sessionCounter++}` })), { result: 'allowed-once', nextCalls: 0 }, command)
+      assert.equal(app.llmCalls, 1, command)
+    }
+    const bare = harness({ config: { sessionMemory: false } })
+    assert.deepEqual(await bare.run(requestOf({ toolName: 'write', command: target, sessionId: 'session-trusted-bare' })), { result: MANUAL, nextCalls: 1 })
+    assert.equal(bare.llmCalls, 0)
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+  }
+})
+
+test('compileTrustedWriteRoots validates entries and resolves the harness home', () => {
+  const home = path.join(os.homedir(), 'dsh-home-test')
+  assert.deepEqual(
+    compileTrustedWriteRoots({ trustedWriteRoots: ['/opt/a', 'D:\\work\\b'] }, { DSH_HOME: home }),
+    [path.resolve('/opt/a'), path.resolve('D:\\work\\b'), path.resolve(home)],
+  )
+  assert.deepEqual(
+    compileTrustedWriteRoots({ trustedWriteRoots: ['/opt/a'], trustDshHome: false }, { DSH_HOME: home }),
+    [path.resolve('/opt/a')],
+  )
+  assert.deepEqual(compileTrustedWriteRoots({}, { DSH_HOME: '  ' }), [path.resolve(path.join(os.homedir(), '.dsh'))])
+  assert.deepEqual(compileTrustedWriteRoots({}, { DSH_HOME: '~/env-dsh' }), [path.join(os.homedir(), 'env-dsh')])
+  for (const entry of ['relative/path', '', ' ', '~/code', '~', '.']) {
+    assert.throws(() => compileTrustedWriteRoots({ trustedWriteRoots: [entry] }, {}), /invalid trusted write root/, entry)
+  }
+})
+
+test('explicit shell writes cover common commands and preserve read-only redirections', async () => {
+  for (const command of [
+    'echo x > ../outside.txt',
+    'printf x>>/etc/out',
+    'tee /etc/out',
+    'touch ../outside.txt',
+    'mkdir -p ../outside',
+    'mv ./source ../outside',
+    'sed -i s/a/b/ ../outside.txt',
+  ]) {
+    const app = harness()
+    assert.deepEqual(await app.run(requestOf({ command })), { result: MANUAL, nextCalls: 1 }, command)
+    assert.equal(app.llmCalls, 0, command)
+  }
+
+  for (const command of ['cat < /etc/passwd', 'cat <<EOF', 'cat /etc/passwd']) {
+    const app = harness()
+    assert.deepEqual(await app.run(requestOf({ command })), { result: 'allowed-once', nextCalls: 0 }, command)
+    assert.equal(app.llmCalls, 1, command)
+  }
+})
+
+test('edit and write outside workspace delegate before classification', async () => {
+  let sessionCounter = 0
+  for (const toolName of ['edit', 'write']) {
+    for (const filePath of ['/etc/x', '../other/file', '/workspace/project/../../etc/x', '/workspace/project2/x', '~/outside-file']) {
+      const app = harness({ config: { sessionMemory: false } })
+      const request = requestOf({ toolName, command: filePath, sessionId: `session-outside-${sessionCounter++}` })
+      assert.deepEqual(await app.run(request), { result: MANUAL, nextCalls: 1 }, `${toolName} ${filePath}`)
+      assert.equal(app.llmCalls, 0, `${toolName} ${filePath}`)
+    }
+  }
+})
+
+test('missing workspace and dynamic or variable write targets fail closed before classification', async () => {
+  for (const [command, cwd] of [
+    ['echo x>/etc/x', null],
+    ['python -c "open(\'/etc/x\', \'w\').write(\'x\')"', '/workspace/project'],
+    ['python3 -c "open(\'/etc/x\', \'w\').write(\'x\')"', '/workspace/project'],
+    ['node -e "fs.writeFileSync(\'/etc/x\', \'x\')"', '/workspace/project'],
+    ['sh -c "echo x > /etc/x"', '/workspace/project'],
+    ['bash -c "echo x > /etc/x"', '/workspace/project'],
+    ['pwsh -command "Set-Content C:\\\\outside.txt x"', '/workspace/project'],
+    ['xargs touch', '/workspace/project'],
+    ['echo x > "$OUTPUT_PATH"', '/workspace/project'],
+    ['echo x > "${OUTPUT_DIR}/out"', '/workspace/project'],
+    ['echo x > %OUTPUT_PATH%', '/workspace/project'],
+  ]) {
+    const app = harness()
+    const request = requestOf({ command, cwd: cwd ?? '/workspace/project' })
+    if (cwd === null) request.agent.session.header.cwd = undefined
+    assert.deepEqual(await app.run(request), { result: MANUAL, nextCalls: 1 }, command)
+    assert.equal(app.llmCalls, 0, command)
+  }
+})
+
+test('edit and write inside workspace retain automatic classification', async () => {
+  for (const toolName of ['edit', 'write']) {
+    for (const filePath of ['src/../output.txt', './output.txt', '/workspace/project2/../project/output.txt']) {
+      const app = harness()
+      const request = requestOf({ toolName, command: filePath })
+      assert.deepEqual(await app.run(request), { result: 'allowed-once', nextCalls: 0 }, `${toolName} ${filePath}`)
+      assert.equal(app.llmCalls, 1, `${toolName} ${filePath}`)
+    }
+  }
+})
+
+test('temporary write targets retain automatic classification', async () => {
+  for (const [command, cwd] of [
+    ['echo x > /tmp/out', '/workspace/project'],
+    ['touch /var/tmp/out', '/workspace/project'],
+    ['echo x > C:\\\\Users\\tester\\AppData\\Local\\Temp\\out.txt', 'C:\\work\\project'],
+  ]) {
+    const app = harness()
+    assert.deepEqual(await app.run(requestOf({ command, cwd })), { result: 'allowed-once', nextCalls: 0 }, command)
+    assert.equal(app.llmCalls, 1, command)
+  }
+})
+
+test('malformed edit and write arguments fail closed', async () => {
+  let sessionCounter = 0
+  for (const toolArguments of ['{', JSON.stringify({}), JSON.stringify({ file_path: 42 })]) {
+    const app = harness({ config: { sessionMemory: false } })
+    const request = requestOf({ toolName: 'edit', command: 'ignored', toolArguments, sessionId: `session-malformed-${sessionCounter++}` })
+    assert.deepEqual(await app.run(request), { result: MANUAL, nextCalls: 1 })
+    assert.equal(app.llmCalls, 0)
+  }
+})
+
 test('latestUserMessage selects the newest genuine user text and ignores later runtime context', async () => {
   const app = harness()
   const first = 'a'.repeat(1997)
@@ -537,6 +806,7 @@ test('approve is the only automatic approval exit', async () => {
     justification: 'escalate sandbox to danger-full-access: install a dependency from npm',
     targetSandboxMode: 'danger-full-access',
     workspacePath: '/workspace/project',
+    trustedWriteRoots: evidence.trustedWriteRoots,
     latestUserMessage: null,
   })
   assert.match(
@@ -548,6 +818,20 @@ test('approve is the only automatic approval exit', async () => {
     /For ordinary git push requests, pushing to the user's own fork or working branch is routine;/,
   )
   assert.match(app.logs[0], /decision=auto-approve verdict=approve/)
+})
+
+test('evidence trustedWriteRoots reflect the compiled configuration', async () => {
+  const previous = process.env.DSH_HOME
+  process.env.DSH_HOME = path.join(os.homedir(), 'dsh-auto-approve-evidence-home')
+  try {
+    const custom = harness({ config: { trustedWriteRoots: ['/opt/extra'], trustDshHome: false } })
+    assert.deepEqual(await custom.run(), { result: 'allowed-once', nextCalls: 0 })
+    const evidence = JSON.parse(custom.lastLlmOptions.messages[0].content[0].text)
+    assert.deepEqual(evidence.trustedWriteRoots, [path.resolve('/opt/extra')])
+  } finally {
+    if (previous === undefined) delete process.env.DSH_HOME
+    else process.env.DSH_HOME = previous
+  }
 })
 
 test('classifierPrompt replaces the default system prompt', async () => {
@@ -1125,6 +1409,18 @@ test('invalid regular expressions fail loudly at plugin load', () => {
   assert.throws(
     () => apply(ctx, { extraDangerPatterns: ['['] }),
     /dsh-auto-approve: invalid danger pattern/,
+  )
+})
+
+test('invalid trusted write roots fail loudly at plugin load', () => {
+  const ctx = {
+    get: () => undefined,
+    on: () => { throw new Error('listener must not register') },
+    logger: { info() {} },
+  }
+  assert.throws(
+    () => apply(ctx, { trustedWriteRoots: ['relative/path'] }),
+    /dsh-auto-approve: invalid trusted write root/,
   )
 })
 
